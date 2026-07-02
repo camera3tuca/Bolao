@@ -160,58 +160,84 @@ def render_dashboard():
     st.title("⚽ Bolão de Futebol - Dashboard")
 
     st.sidebar.header("Administração")
+    admin_pw = st.sidebar.text_input("Senha de Administrador", type="password")
 
-    # Adicionar Partida e Aposta
-    st.sidebar.subheader("Criar/Atualizar Partida")
-    team_a_input = st.sidebar.text_input("Time A", "Brasil")
-    team_b_input = st.sidebar.text_input("Time B", "Noruega")
-    bet_val = st.sidebar.number_input("Valor da Aposta (R$)", min_value=0.0, value=10.0, step=1.0)
+    if admin_pw == "admin":
+        # Adicionar Partida e Aposta
+        st.sidebar.subheader("Criar/Atualizar Partida")
+        team_a_input = st.sidebar.text_input("Time A", "Brasil")
+        team_b_input = st.sidebar.text_input("Time B", "Noruega")
+        bet_val = st.sidebar.number_input("Valor da Aposta (R$)", min_value=0.0, value=10.0, step=1.0)
 
-    if st.sidebar.button("Salvar Partida"):
-        match_id = create_match(team_a_input, team_b_input, bet_amount=bet_val)
-        st.sidebar.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val})")
+        if st.sidebar.button("Salvar Partida"):
+            match_id = create_match(team_a_input, team_b_input, bet_amount=bet_val)
+            st.sidebar.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val})")
 
-    # Finalizar Partida
-    st.sidebar.subheader("Finalizar Partida")
-    match_to_finish = st.sidebar.selectbox("Selecione a partida", options=list(matches.keys()))
-    if match_to_finish:
-        score_a = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_a']}", min_value=0, step=1)
-        score_b = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_b']}", min_value=0, step=1)
-        if st.sidebar.button("Encerrar Partida e Calcular"):
-            update_match_result(match_to_finish, score_a, score_b)
-            st.sidebar.success("Partida encerrada!")
+        # Finalizar Partida
+        st.sidebar.subheader("Finalizar Partida")
+        if matches:
+            match_to_finish = st.sidebar.selectbox("Selecione a partida para encerrar", options=list(matches.keys()))
+            if match_to_finish:
+                score_a = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_a']}", min_value=0, step=1)
+                score_b = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_b']}", min_value=0, step=1)
+                if st.sidebar.button("Encerrar Partida e Calcular"):
+                    update_match_result(match_to_finish, score_a, score_b)
+                    st.sidebar.success("Partida encerrada!")
+    else:
+        st.sidebar.info("Área restrita. Insira a senha para liberar o painel.")
 
     # Formulário para Registrar Palpite
     st.header("📝 Registrar Palpite")
-    with st.form("prediction_form"):
-        st.write("Insira seus dados para participar do bolão:")
-        user_name = st.text_input("Seu Nome")
-        user_phone = st.text_input("Seu Telefone (opcional)")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            team_a_pred = st.text_input("Time A (ex: Brasil)")
-            score_a_pred = st.number_input("Gols Time A", min_value=0, step=1)
-        with col2:
-            team_b_pred = st.text_input("Time B (ex: Argentina)")
-            score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
+    active_matches = {k: v for k, v in matches.items() if not v["completed"]}
 
-        submit_btn = st.form_submit_button("Enviar Palpite")
+    if not active_matches:
+        st.info("Não há partidas abertas para receber palpites no momento.")
+    else:
+        with st.form("prediction_form"):
+            st.write("Insira seus dados para participar do bolão:")
+            user_name = st.text_input("Seu Nome")
+            user_phone = st.text_input("Seu Telefone (obrigatório, ex: 11999999999)")
 
-        if submit_btn:
-            if not user_name or not team_a_pred or not team_b_pred:
-                st.error("Por favor, preencha nome e os nomes dos times!")
-            else:
-                # Simular o formato de texto que o parse_prediction espera, ou inserir direto.
-                # Como o usuario pediu formulário de dados, vamos simular a mensagem.
-                fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
-                success, msg = parse_prediction(fake_msg)
+            selected_match_id = st.selectbox(
+                "Selecione a Partida",
+                options=list(active_matches.keys()),
+                format_func=lambda mid: f"{matches[mid]['team_a']} x {matches[mid]['team_b']}"
+            )
 
-                # Opcional: Aqui poderíamos salvar o user_phone no dict users.
-                if success:
-                    st.success(msg)
+            # The selectbox will populate these variables automatically for the user
+            team_a_pred = matches[selected_match_id]['team_a'] if selected_match_id else ""
+            team_b_pred = matches[selected_match_id]['team_b'] if selected_match_id else ""
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Time A: {team_a_pred}**")
+                score_a_pred = st.number_input("Gols Time A", min_value=0, step=1)
+            with col2:
+                st.write(f"**Time B: {team_b_pred}**")
+                score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
+
+            submit_btn = st.form_submit_button("Enviar Palpite")
+
+            if submit_btn:
+                import re as regex_lib
+                # Simple validation for Brazilian phone numbers (10 to 11 digits)
+                phone_pattern = r'^\d{10,11}$'
+
+                if not user_name:
+                    st.error("Por favor, preencha o seu nome!")
+                elif not user_phone or not regex_lib.match(phone_pattern, re.sub(r'\D', '', user_phone)):
+                    st.error("Por favor, informe um número de WhatsApp válido (com DDD, somente números).")
+                elif not selected_match_id:
+                     st.error("Nenhuma partida selecionada!")
                 else:
-                    st.error(msg)
+                    fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
+                    success, msg = parse_prediction(fake_msg)
+
+                    if success:
+                        st.success(f"{msg} Entraremos em contato via {user_phone} se você ganhar!")
+                    else:
+                        st.error(msg)
 
     # Exibir Ranking e Palpites Ativos
     col_rank, col_preds = st.columns(2)
