@@ -1,4 +1,6 @@
 import re
+import streamlit as st
+import pandas as pd
 
 # Data structures to store our state
 users = {}          # dict of user_id -> {"name": str, "score": int}
@@ -149,3 +151,118 @@ def generate_ranking():
     ranking = list(users.values())
     ranking.sort(key=lambda x: x["score"], reverse=True)
     return ranking
+
+# ---------------------------------------------------------
+# Streamlit Interface
+# ---------------------------------------------------------
+def render_dashboard():
+    st.set_page_config(page_title="Bolão de Futebol", page_icon="⚽")
+    st.title("⚽ Bolão de Futebol - Dashboard")
+
+    st.sidebar.header("Administração")
+
+    # Adicionar Partida e Aposta
+    st.sidebar.subheader("Criar/Atualizar Partida")
+    team_a_input = st.sidebar.text_input("Time A", "Brasil")
+    team_b_input = st.sidebar.text_input("Time B", "Noruega")
+    bet_val = st.sidebar.number_input("Valor da Aposta (R$)", min_value=0.0, value=10.0, step=1.0)
+
+    if st.sidebar.button("Salvar Partida"):
+        match_id = create_match(team_a_input, team_b_input, bet_amount=bet_val)
+        st.sidebar.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val})")
+
+    # Finalizar Partida
+    st.sidebar.subheader("Finalizar Partida")
+    match_to_finish = st.sidebar.selectbox("Selecione a partida", options=list(matches.keys()))
+    if match_to_finish:
+        score_a = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_a']}", min_value=0, step=1)
+        score_b = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_b']}", min_value=0, step=1)
+        if st.sidebar.button("Encerrar Partida e Calcular"):
+            update_match_result(match_to_finish, score_a, score_b)
+            st.sidebar.success("Partida encerrada!")
+
+    # Formulário para Registrar Palpite
+    st.header("📝 Registrar Palpite")
+    with st.form("prediction_form"):
+        st.write("Insira seus dados para participar do bolão:")
+        user_name = st.text_input("Seu Nome")
+        user_phone = st.text_input("Seu Telefone (opcional)")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            team_a_pred = st.text_input("Time A (ex: Brasil)")
+            score_a_pred = st.number_input("Gols Time A", min_value=0, step=1)
+        with col2:
+            team_b_pred = st.text_input("Time B (ex: Argentina)")
+            score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
+
+        submit_btn = st.form_submit_button("Enviar Palpite")
+
+        if submit_btn:
+            if not user_name or not team_a_pred or not team_b_pred:
+                st.error("Por favor, preencha nome e os nomes dos times!")
+            else:
+                # Simular o formato de texto que o parse_prediction espera, ou inserir direto.
+                # Como o usuario pediu formulário de dados, vamos simular a mensagem.
+                fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
+                success, msg = parse_prediction(fake_msg)
+
+                # Opcional: Aqui poderíamos salvar o user_phone no dict users.
+                if success:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+    # Exibir Ranking e Palpites Ativos
+    col_rank, col_preds = st.columns(2)
+
+    with col_rank:
+        st.header("🏆 Ranking Geral")
+        ranking = generate_ranking()
+        if ranking:
+            df_ranking = pd.DataFrame(ranking)
+            st.dataframe(df_ranking, use_container_width=True)
+        else:
+            st.info("Nenhum usuário no ranking ainda.")
+
+    with col_preds:
+        st.header("📊 Palpites Registrados")
+        if predictions:
+            df_preds = pd.DataFrame(predictions)
+            st.dataframe(df_preds, use_container_width=True)
+        else:
+            st.info("Nenhum palpite registrado.")
+
+    # Exibir Status dos Bolões (Pix)
+    st.header("💰 Status dos Prêmios (Pix)")
+    for mid, match in matches.items():
+        if match["completed"]:
+            tot_pot, prize_per, winners = calculate_prize_split(mid)
+            st.markdown(f"**{match['team_a']} {match['score_a']} x {match['score_b']} {match['team_b']}**")
+            st.write(f"Pote Total: **R$ {tot_pot:.2f}** | Prêmio por Ganhador: **R$ {prize_per:.2f}**")
+            if winners:
+                # Converter user_ids para nomes reais do dicionário users
+                winner_names = [users.get(w, {}).get("name", w) for w in winners]
+                st.write(f"Ganhadores: {', '.join(winner_names)}")
+            else:
+                st.write("Sem ganhadores exatos para esta partida.")
+            st.divider()
+
+if __name__ == "__main__":
+    # Quando rodar via Streamlit, precisamos garantir que o estado persista em memória
+    # O Streamlit recarrega o script a cada interação, então dicts globais zeram.
+    # Vamos amarrar o estado global ao st.session_state
+
+    if "users" not in st.session_state:
+        st.session_state.users = users
+    if "matches" not in st.session_state:
+        st.session_state.matches = matches
+    if "predictions" not in st.session_state:
+        st.session_state.predictions = predictions
+
+    # Re-apontar as variáveis globais para a sessão
+    users = st.session_state.users
+    matches = st.session_state.matches
+    predictions = st.session_state.predictions
+
+    render_dashboard()
