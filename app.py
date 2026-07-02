@@ -12,7 +12,7 @@ def get_or_create_user(name):
         users[user_id] = {"name": name, "score": 0}
     return user_id
 
-def create_match(team_a, team_b):
+def create_match(team_a, team_b, bet_amount=0.0):
     match_id = f"{team_a}_{team_b}".lower().replace(" ", "_")
     if match_id not in matches:
          matches[match_id] = {
@@ -20,8 +20,14 @@ def create_match(team_a, team_b):
              "team_b": team_b,
              "score_a": None,
              "score_b": None,
-             "completed": False
+             "completed": False,
+             "bet_amount": float(bet_amount)
          }
+    else:
+        # If the match exists, we should update the bet amount to allow admins to set it later
+        if bet_amount > 0:
+            matches[match_id]["bet_amount"] = float(bet_amount)
+
     return match_id
 
 def parse_prediction(message_text):
@@ -88,6 +94,40 @@ def update_match_result(match_id, score_a, score_b):
         matches[match_id]["completed"] = True
         return True
     return False
+
+def calculate_prize_split(match_id):
+    if match_id not in matches or not matches[match_id]["completed"]:
+        return 0, 0, []
+
+    match = matches[match_id]
+    bet_amount = match.get("bet_amount", 0.0)
+
+    # Find all predictions for this match
+    match_predictions = [p for p in predictions if p["match_id"] == match_id]
+
+    # Total pot is number of participants * bet amount
+    total_pot = len(match_predictions) * bet_amount
+
+    if total_pot == 0:
+        return 0, 0, []
+
+    # Find winners (exact match score -> 3 points)
+    winners = []
+    for pred in match_predictions:
+        points = calculate_score(
+            pred["score_a"], pred["score_b"],
+            match["score_a"], match["score_b"]
+        )
+        if points == 3:
+            winners.append(pred["user_id"])
+
+    # Calculate split
+    if not winners:
+        # If no one wins, maybe pot accumulates or is returned. For now, no winners.
+        return total_pot, 0, []
+
+    prize_per_winner = total_pot / len(winners)
+    return total_pot, prize_per_winner, winners
 
 def generate_ranking():
     # Reset all users' scores
