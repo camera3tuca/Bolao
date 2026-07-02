@@ -1,6 +1,16 @@
 import app
+import os
 
 def run_tests():
+    # Limpar banco de dados local para nao viciar testes
+    if os.path.exists(app.DATA_FILE):
+        os.remove(app.DATA_FILE)
+
+    # Reiniciar estado global em memoria
+    app.users.clear()
+    app.matches.clear()
+    app.predictions.clear()
+
     print("Testing message parsing...")
 
     # Test valid parsing
@@ -12,9 +22,9 @@ def run_tests():
     ]
 
     for msg in messages:
-        success, response = app.parse_prediction(msg)
+        success, response = app.parse_prediction(msg, paid=True)
         assert success, f"Failed to parse: {msg}"
-        print(f"  Parsed: {msg}")
+        print(f"  Parsed: {msg} (Paid)")
 
     # Check match creation
     match_id = "brasil_argentina"
@@ -58,7 +68,7 @@ def run_tests():
     ]
 
     for msg in messages_pix:
-        app.parse_prediction(msg)
+        app.parse_prediction(msg, paid=True)
 
     # Now admin sets the R$ 10 bet for the match
     app.create_match("Brasil", "Noruega", bet_amount=10.0)
