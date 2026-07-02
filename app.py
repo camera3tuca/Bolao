@@ -162,7 +162,7 @@ def render_dashboard():
     st.sidebar.header("Administração")
     admin_pw = st.sidebar.text_input("Senha de Administrador", type="password")
 
-    if admin_pw == "admin":
+    if admin_pw == "5075":
         # Adicionar Partida e Aposta
         st.sidebar.subheader("Criar/Atualizar Partida")
         team_a_input = st.sidebar.text_input("Time A", "Brasil")
