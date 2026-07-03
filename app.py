@@ -1,11 +1,40 @@
 import re
 import streamlit as st
 import pandas as pd
+import json
+import os
+
+DATA_FILE = "data.json"
 
 # Data structures to store our state
 users = {}          # dict of user_id -> {"name": str, "score": int}
 matches = {}        # dict of match_id -> {"team_a": str, "team_b": str, "score_a": int, "score_b": int, "completed": bool}
 predictions = []    # list of dicts: {"user_id": str, "match_id": str, "score_a": int, "score_b": int}
+
+def save_data():
+    data = {
+        "users": users,
+        "matches": matches,
+        "predictions": predictions
+    }
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def load_data():
+    global users, matches, predictions
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+                users = data.get("users", {})
+                matches = data.get("matches", {})
+                predictions = data.get("predictions", [])
+        except json.JSONDecodeError:
+            # File might be empty or corrupted, fallback to empty defaults
+            pass
+
+# Initialize data from file if available
+load_data()
 
 def get_or_create_user(name):
     # Simple ID generation based on name
@@ -30,9 +59,10 @@ def create_match(team_a, team_b, bet_amount=0.0):
         if bet_amount > 0:
             matches[match_id]["bet_amount"] = float(bet_amount)
 
+    save_data()
     return match_id
 
-def parse_prediction(message_text):
+def parse_prediction(message_text, paid=False):
     # Expected format: "User Name: Team A 2 x 1 Team B" or "User Name: TeamA 2x1 TeamB"
     # We use a regex to capture:
     # Group 1: User name
@@ -64,9 +94,11 @@ def parse_prediction(message_text):
         "user_id": user_id,
         "match_id": match_id,
         "score_a": score_a,
-        "score_b": score_b
+        "score_b": score_b,
+        "paid": paid
     })
 
+    save_data()
     return True, f"Palpite de {user_name} registrado com sucesso para {team_a} x {team_b}."
 
 def calculate_score(predicted_a, predicted_b, actual_a, actual_b):
@@ -94,6 +126,7 @@ def update_match_result(match_id, score_a, score_b):
         matches[match_id]["score_a"] = score_a
         matches[match_id]["score_b"] = score_b
         matches[match_id]["completed"] = True
+        save_data()
         return True
     return False
 
@@ -217,6 +250,8 @@ def render_dashboard():
                 st.write(f"**Time B: {team_b_pred}**")
                 score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
 
+            paid_checkbox = st.checkbox("Pagamento da aposta realizado?")
+
             submit_btn = st.form_submit_button("Enviar Palpite")
 
             if submit_btn:
@@ -232,7 +267,7 @@ def render_dashboard():
                      st.error("Nenhuma partida selecionada!")
                 else:
                     fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
-                    success, msg = parse_prediction(fake_msg)
+                    success, msg = parse_prediction(fake_msg, paid=paid_checkbox)
 
                     if success:
                         st.success(f"{msg} Entraremos em contato via {user_phone} se você ganhar!")
