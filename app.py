@@ -1,68 +1,107 @@
 import re
 import streamlit as st
 import pandas as pd
-import json
 import os
+import sqlite3
 
-DATA_FILE = "data.json"
+DB_FILE = "bolao.db"
 
-# Data structures to store our state
-users = {}          # dict of user_id -> {"name": str, "score": int}
-matches = {}        # dict of match_id -> {"team_a": str, "team_b": str, "score_a": int, "score_b": int, "completed": bool}
-predictions = []    # list of dicts: {"user_id": str, "match_id": str, "score_a": int, "score_b": int}
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def save_data():
-    data = {
-        "users": users,
-        "matches": matches,
-        "predictions": predictions
-    }
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
+def init_db():
+    conn = get_db_connection()
+    c = conn.cursor()
 
-def load_data():
-    global users, matches, predictions
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f:
-                data = json.load(f)
-                users = data.get("users", {})
-                matches = data.get("matches", {})
-                predictions = data.get("predictions", [])
-        except json.JSONDecodeError:
-            # File might be empty or corrupted, fallback to empty defaults
-            pass
+    # Create users table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            phone TEXT,
+            score INTEGER DEFAULT 0
+        )
+    ''')
 
-# Initialize data from file if available
-load_data()
+    # Ensure phone column exists for existing DBs
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN phone TEXT')
+    except sqlite3.OperationalError:
+        pass # Column already exists
 
-def get_or_create_user(name):
+    # Create matches table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id TEXT PRIMARY KEY,
+            team_a TEXT NOT NULL,
+            team_b TEXT NOT NULL,
+            score_a INTEGER,
+            score_b INTEGER,
+            completed BOOLEAN DEFAULT 0,
+            bet_amount REAL DEFAULT 0.0
+        )
+    ''')
+
+    # Create predictions table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS predictions (
+            user_id TEXT,
+            match_id TEXT,
+            score_a INTEGER NOT NULL,
+            score_b INTEGER NOT NULL,
+            paid BOOLEAN DEFAULT 0,
+            PRIMARY KEY (user_id, match_id),
+            FOREIGN KEY (user_id) REFERENCES users (user_id),
+            FOREIGN KEY (match_id) REFERENCES matches (match_id)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+# Initialize DB on app start
+init_db()
+
+def get_or_create_user(name, phone=""):
     # Simple ID generation based on name
     user_id = name.lower().replace(" ", "_")
-    if user_id not in users:
-        users[user_id] = {"name": name, "score": 0}
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    user = c.fetchone()
+
+    if not user:
+        c.execute('INSERT INTO users (user_id, name, phone, score) VALUES (?, ?, ?, ?)', (user_id, name, phone, 0))
+    else:
+        if phone and not user["phone"]:
+            c.execute('UPDATE users SET phone = ? WHERE user_id = ?', (phone, user_id))
+
+    conn.commit()
+    conn.close()
     return user_id
 
 def create_match(team_a, team_b, bet_amount=0.0):
     match_id = f"{team_a}_{team_b}".lower().replace(" ", "_")
-    if match_id not in matches:
-         matches[match_id] = {
-             "team_a": team_a,
-             "team_b": team_b,
-             "score_a": None,
-             "score_b": None,
-             "completed": False,
-             "bet_amount": float(bet_amount)
-         }
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,))
+    if not c.fetchone():
+         c.execute('''
+            INSERT INTO matches (match_id, team_a, team_b, completed, bet_amount)
+            VALUES (?, ?, ?, ?, ?)
+         ''', (match_id, team_a, team_b, False, float(bet_amount)))
     else:
         # If the match exists, we should update the bet amount to allow admins to set it later
         if bet_amount > 0:
-            matches[match_id]["bet_amount"] = float(bet_amount)
+            c.execute('UPDATE matches SET bet_amount = ? WHERE match_id = ?', (float(bet_amount), match_id))
 
-    save_data()
+    conn.commit()
+    conn.close()
     return match_id
 
-def parse_prediction(message_text, paid=False):
+def parse_prediction(message_text, phone="", paid=False):
     # Expected format: "User Name: Team A 2 x 1 Team B" or "User Name: TeamA 2x1 TeamB"
     # We use a regex to capture:
     # Group 1: User name
@@ -82,23 +121,23 @@ def parse_prediction(message_text, paid=False):
     score_b = int(match.group(4))
     team_b = match.group(5).strip()
 
-    user_id = get_or_create_user(user_name)
+    user_id = get_or_create_user(user_name, phone=phone)
     match_id = create_match(team_a, team_b)
 
     # Store or update the prediction
-    # Remove existing prediction for this user and match if it exists
-    global predictions
-    predictions = [p for p in predictions if not (p["user_id"] == user_id and p["match_id"] == match_id)]
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO predictions (user_id, match_id, score_a, score_b, paid)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, match_id) DO UPDATE SET
+            score_a=excluded.score_a,
+            score_b=excluded.score_b,
+            paid=excluded.paid
+    ''', (user_id, match_id, score_a, score_b, paid))
+    conn.commit()
+    conn.close()
 
-    predictions.append({
-        "user_id": user_id,
-        "match_id": match_id,
-        "score_a": score_a,
-        "score_b": score_b,
-        "paid": paid
-    })
-
-    save_data()
     return True, f"Palpite de {user_name} registrado com sucesso para {team_a} x {team_b}."
 
 def calculate_score(predicted_a, predicted_b, actual_a, actual_b):
@@ -122,28 +161,40 @@ def calculate_score(predicted_a, predicted_b, actual_a, actual_b):
     return 0
 
 def update_match_result(match_id, score_a, score_b):
-    if match_id in matches:
-        matches[match_id]["score_a"] = score_a
-        matches[match_id]["score_b"] = score_b
-        matches[match_id]["completed"] = True
-        save_data()
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,))
+    if c.fetchone():
+        c.execute('''
+            UPDATE matches
+            SET score_a = ?, score_b = ?, completed = 1
+            WHERE match_id = ?
+        ''', (score_a, score_b, match_id))
+        conn.commit()
+        conn.close()
         return True
+    conn.close()
     return False
 
 def calculate_prize_split(match_id):
-    if match_id not in matches or not matches[match_id]["completed"]:
+    conn = get_db_connection()
+    c = conn.cursor()
+    match = c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,)).fetchone()
+
+    if not match or not match["completed"]:
+        conn.close()
         return 0, 0, []
 
-    match = matches[match_id]
-    bet_amount = match.get("bet_amount", 0.0)
+    bet_amount = match["bet_amount"]
 
     # Find all predictions for this match
-    match_predictions = [p for p in predictions if p["match_id"] == match_id]
+    match_predictions = c.execute('SELECT * FROM predictions WHERE match_id = ?', (match_id,)).fetchall()
 
     # Total pot is number of participants * bet amount
     total_pot = len(match_predictions) * bet_amount
 
     if total_pot == 0:
+        conn.close()
         return 0, 0, []
 
     # Find winners (exact match score -> 3 points)
@@ -156,6 +207,8 @@ def calculate_prize_split(match_id):
         if points == 3:
             winners.append(pred["user_id"])
 
+    conn.close()
+
     # Calculate split
     if not winners:
         # If no one wins, maybe pot accumulates or is returned. For now, no winners.
@@ -165,25 +218,35 @@ def calculate_prize_split(match_id):
     return total_pot, prize_per_winner, winners
 
 def generate_ranking():
-    # Reset all users' scores
-    for user_id in users:
-        users[user_id]["score"] = 0
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # Fetch all users initially to ensure everyone is in the ranking with at least 0
+    all_users = {row["user_id"]: dict(row) for row in c.execute('SELECT user_id, name, score FROM users').fetchall()}
+    for u in all_users.values():
+        u["score"] = 0 # Calculate from scratch in-memory
 
     # Recalculate based on completed matches and predictions
-    for pred in predictions:
-        match_id = pred["match_id"]
-        match = matches.get(match_id)
-        if match and match["completed"]:
+    completed_matches = c.execute('SELECT * FROM matches WHERE completed = 1').fetchall()
+    for match in completed_matches:
+        preds = c.execute('SELECT * FROM predictions WHERE match_id = ?', (match["match_id"],)).fetchall()
+        for pred in preds:
             points = calculate_score(
                 pred["score_a"], pred["score_b"],
                 match["score_a"], match["score_b"]
             )
-            users[pred["user_id"]]["score"] += points
+            if points > 0 and pred["user_id"] in all_users:
+                all_users[pred["user_id"]]["score"] += points
 
-    # Generate sorted ranking list
-    ranking = list(users.values())
+    # Sort the dictionary values to generate a ranking list
+    ranking = list(all_users.values())
     ranking.sort(key=lambda x: x["score"], reverse=True)
-    return ranking
+
+    # Only return name and score for UI
+    final_ranking = [{"name": u["name"], "score": u["score"]} for u in ranking]
+
+    conn.close()
+    return final_ranking
 
 # ---------------------------------------------------------
 # Streamlit Interface
@@ -195,6 +258,14 @@ def render_dashboard():
     st.sidebar.header("Administração")
     admin_pw = st.sidebar.text_input("Senha de Administrador", type="password")
 
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # Fetch matches
+    all_matches = c.execute('SELECT * FROM matches').fetchall()
+    matches_dict = {m["match_id"]: dict(m) for m in all_matches}
+    active_matches = {mid: m for mid, m in matches_dict.items() if not m["completed"]}
+
     if admin_pw == "5075":
         # Adicionar Partida e Aposta
         st.sidebar.subheader("Criar/Atualizar Partida")
@@ -205,24 +276,24 @@ def render_dashboard():
         if st.sidebar.button("Salvar Partida"):
             match_id = create_match(team_a_input, team_b_input, bet_amount=bet_val)
             st.sidebar.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val})")
+            st.rerun()
 
         # Finalizar Partida
         st.sidebar.subheader("Finalizar Partida")
-        if matches:
-            match_to_finish = st.sidebar.selectbox("Selecione a partida para encerrar", options=list(matches.keys()))
+        if matches_dict:
+            match_to_finish = st.sidebar.selectbox("Selecione a partida para encerrar", options=list(matches_dict.keys()))
             if match_to_finish:
-                score_a = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_a']}", min_value=0, step=1)
-                score_b = st.sidebar.number_input(f"Gols {matches[match_to_finish]['team_b']}", min_value=0, step=1)
+                score_a = st.sidebar.number_input(f"Gols {matches_dict[match_to_finish]['team_a']}", min_value=0, step=1)
+                score_b = st.sidebar.number_input(f"Gols {matches_dict[match_to_finish]['team_b']}", min_value=0, step=1)
                 if st.sidebar.button("Encerrar Partida e Calcular"):
                     update_match_result(match_to_finish, score_a, score_b)
                     st.sidebar.success("Partida encerrada!")
+                    st.rerun()
     else:
         st.sidebar.info("Área restrita. Insira a senha para liberar o painel.")
 
     # Formulário para Registrar Palpite
     st.header("📝 Registrar Palpite")
-
-    active_matches = {k: v for k, v in matches.items() if not v["completed"]}
 
     if not active_matches:
         st.info("Não há partidas abertas para receber palpites no momento.")
@@ -235,12 +306,12 @@ def render_dashboard():
             selected_match_id = st.selectbox(
                 "Selecione a Partida",
                 options=list(active_matches.keys()),
-                format_func=lambda mid: f"{matches[mid]['team_a']} x {matches[mid]['team_b']}"
+                format_func=lambda mid: f"{active_matches[mid]['team_a']} x {active_matches[mid]['team_b']}"
             )
 
             # The selectbox will populate these variables automatically for the user
-            team_a_pred = matches[selected_match_id]['team_a'] if selected_match_id else ""
-            team_b_pred = matches[selected_match_id]['team_b'] if selected_match_id else ""
+            team_a_pred = active_matches[selected_match_id]['team_a'] if selected_match_id else ""
+            team_b_pred = active_matches[selected_match_id]['team_b'] if selected_match_id else ""
 
             col1, col2 = st.columns(2)
             with col1:
@@ -267,7 +338,7 @@ def render_dashboard():
                      st.error("Nenhuma partida selecionada!")
                 else:
                     fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
-                    success, msg = parse_prediction(fake_msg, paid=paid_checkbox)
+                    success, msg = parse_prediction(fake_msg, phone=user_phone, paid=paid_checkbox)
 
                     if success:
                         st.success(f"{msg} Entraremos em contato via {user_phone} se você ganhar!")
@@ -282,48 +353,40 @@ def render_dashboard():
         ranking = generate_ranking()
         if ranking:
             df_ranking = pd.DataFrame(ranking)
-            st.dataframe(df_ranking, use_container_width=True)
+            st.dataframe(df_ranking, width="stretch")
         else:
             st.info("Nenhum usuário no ranking ainda.")
 
     with col_preds:
         st.header("📊 Palpites Registrados")
-        if predictions:
-            df_preds = pd.DataFrame(predictions)
-            st.dataframe(df_preds, use_container_width=True)
+
+        preds_data = c.execute('SELECT * FROM predictions').fetchall()
+        if preds_data:
+            df_preds = pd.DataFrame([dict(p) for p in preds_data])
+            st.dataframe(df_preds, width="stretch")
         else:
             st.info("Nenhum palpite registrado.")
 
     # Exibir Status dos Bolões (Pix)
     st.header("💰 Status dos Prêmios (Pix)")
-    for mid, match in matches.items():
+
+    # Pre-fetch all users to map IDs to names
+    all_users = {row["user_id"]: row["name"] for row in c.execute('SELECT user_id, name FROM users').fetchall()}
+
+    for mid, match in matches_dict.items():
         if match["completed"]:
             tot_pot, prize_per, winners = calculate_prize_split(mid)
             st.markdown(f"**{match['team_a']} {match['score_a']} x {match['score_b']} {match['team_b']}**")
             st.write(f"Pote Total: **R$ {tot_pot:.2f}** | Prêmio por Ganhador: **R$ {prize_per:.2f}**")
             if winners:
-                # Converter user_ids para nomes reais do dicionário users
-                winner_names = [users.get(w, {}).get("name", w) for w in winners]
+                # Converter user_ids para nomes reais do banco de dados
+                winner_names = [all_users.get(w, w) for w in winners]
                 st.write(f"Ganhadores: {', '.join(winner_names)}")
             else:
                 st.write("Sem ganhadores exatos para esta partida.")
             st.divider()
 
+    conn.close()
+
 if __name__ == "__main__":
-    # Quando rodar via Streamlit, precisamos garantir que o estado persista em memória
-    # O Streamlit recarrega o script a cada interação, então dicts globais zeram.
-    # Vamos amarrar o estado global ao st.session_state
-
-    if "users" not in st.session_state:
-        st.session_state.users = users
-    if "matches" not in st.session_state:
-        st.session_state.matches = matches
-    if "predictions" not in st.session_state:
-        st.session_state.predictions = predictions
-
-    # Re-apontar as variáveis globais para a sessão
-    users = st.session_state.users
-    matches = st.session_state.matches
-    predictions = st.session_state.predictions
-
     render_dashboard()
