@@ -3,13 +3,9 @@ import os
 
 def run_tests():
     # Limpar banco de dados local para nao viciar testes
-    if os.path.exists(app.DATA_FILE):
-        os.remove(app.DATA_FILE)
-
-    # Reiniciar estado global em memoria
-    app.users.clear()
-    app.matches.clear()
-    app.predictions.clear()
+    if os.path.exists(app.DB_FILE):
+        os.remove(app.DB_FILE)
+    app.init_db()
 
     print("Testing message parsing...")
 
@@ -28,11 +24,14 @@ def run_tests():
 
     # Check match creation
     match_id = "brasil_argentina"
-    assert match_id in app.matches
+    conn = app.get_db_connection()
+    c = conn.cursor()
+    assert c.execute('SELECT * FROM matches WHERE match_id=?', (match_id,)).fetchone() is not None
 
     # Check user creation and predictions
-    assert len(app.users) == 4
-    assert len(app.predictions) == 4
+    assert len(c.execute('SELECT * FROM users').fetchall()) == 4
+    assert len(c.execute('SELECT * FROM predictions').fetchall()) == 4
+    conn.close()
 
     print("Testing scoring and ranking...")
 
