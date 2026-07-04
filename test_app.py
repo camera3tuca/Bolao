@@ -3,10 +3,12 @@ import os
 
 import psycopg2
 from psycopg2.extras import DictCursor
+import streamlit as st
 
 def clear_test_data():
     try:
         conn = app.get_db_connection()
+        if not conn: return
         c = conn.cursor(cursor_factory=DictCursor)
         # Delete only the specific test users and matches instead of dropping the entire table
         test_matches = ['brasil_argentina', 'brasil_noruega']
@@ -26,10 +28,24 @@ def clear_test_data():
 def run_tests():
     # Attempting to initialize DB
     try:
-        app.init_db()
+        success = app.init_db()
+        if success is False:
+             print("Skipping tests, DB unconfigured.")
+             return
         clear_test_data()
     except Exception as e:
+        # In CI without db it should just stop
         print(f"Skipping tests, DB connection unavailable: {e}")
+        return
+
+    try:
+        conn = app.get_db_connection()
+        if not conn:
+            print("Skipping tests, DB connection unavailable")
+            return
+        conn.close()
+    except Exception:
+        print("Skipping tests, DB connection unavailable")
         return
 
     print("Testing message parsing...")
