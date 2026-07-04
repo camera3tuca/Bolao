@@ -2,16 +2,27 @@ import re
 import streamlit as st
 import pandas as pd
 import os
-import sqlite3
+import psycopg2
+from psycopg2.extras import DictCursor
 
-DB_FILE = "bolao.db"
+# Load database URL from Streamlit Secrets or environment variables
+DB_URL = os.environ.get("DATABASE_URL")
+try:
+    if "SUPABASE_DB_URL" in st.secrets:
+        DB_URL = st.secrets["SUPABASE_DB_URL"]
+    elif "DATABASE_URL" in st.secrets:
+        DB_URL = st.secrets["DATABASE_URL"]
+except Exception:
+    pass
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DB_URL)
     return conn
 
+@st.cache_resource
 def init_db():
+    if not DB_URL:
+        return
     conn = get_db_connection()
     c = conn.cursor()
 
@@ -26,10 +37,9 @@ def init_db():
     ''')
 
     # Ensure phone column exists for existing DBs
-    try:
-        c.execute('ALTER TABLE users ADD COLUMN phone TEXT')
-    except sqlite3.OperationalError:
-        pass # Column already exists
+    c.execute('''
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;
+    ''')
 
     # Create matches table
     c.execute('''
@@ -39,7 +49,7 @@ def init_db():
             team_b TEXT NOT NULL,
             score_a INTEGER,
             score_b INTEGER,
-            completed BOOLEAN DEFAULT 0,
+            completed BOOLEAN DEFAULT FALSE,
             bet_amount REAL DEFAULT 0.0
         )
     ''')
@@ -51,7 +61,7 @@ def init_db():
             match_id TEXT,
             score_a INTEGER NOT NULL,
             score_b INTEGER NOT NULL,
-            paid BOOLEAN DEFAULT 0,
+            paid BOOLEAN DEFAULT FALSE,
             PRIMARY KEY (user_id, match_id),
             FOREIGN KEY (user_id) REFERENCES users (user_id),
             FOREIGN KEY (match_id) REFERENCES matches (match_id)
@@ -62,21 +72,24 @@ def init_db():
     conn.close()
 
 # Initialize DB on app start
+if not DB_URL:
+    st.error("Configure a DATABASE_URL no .env ou no .streamlit/secrets.toml")
+    st.stop()
 init_db()
 
 def get_or_create_user(name, phone=""):
     # Simple ID generation based on name
     user_id = name.lower().replace(" ", "_")
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
     user = c.fetchone()
 
     if not user:
-        c.execute('INSERT INTO users (user_id, name, phone, score) VALUES (?, ?, ?, ?)', (user_id, name, phone, 0))
+        c.execute('INSERT INTO users (user_id, name, phone, score) VALUES (%s, %s, %s, %s)', (user_id, name, phone, 0))
     else:
         if phone and not user["phone"]:
-            c.execute('UPDATE users SET phone = ? WHERE user_id = ?', (phone, user_id))
+            c.execute('UPDATE users SET phone = %s WHERE user_id = %s', (phone, user_id))
 
     conn.commit()
     conn.close()
@@ -85,17 +98,17 @@ def get_or_create_user(name, phone=""):
 def create_match(team_a, team_b, bet_amount=0.0):
     match_id = f"{team_a}_{team_b}".lower().replace(" ", "_")
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,))
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute('SELECT * FROM matches WHERE match_id = %s', (match_id,))
     if not c.fetchone():
          c.execute('''
             INSERT INTO matches (match_id, team_a, team_b, completed, bet_amount)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
          ''', (match_id, team_a, team_b, False, float(bet_amount)))
     else:
         # If the match exists, we should update the bet amount to allow admins to set it later
         if bet_amount > 0:
-            c.execute('UPDATE matches SET bet_amount = ? WHERE match_id = ?', (float(bet_amount), match_id))
+            c.execute('UPDATE matches SET bet_amount = %s WHERE match_id = %s', (float(bet_amount), match_id))
 
     conn.commit()
     conn.close()
@@ -126,10 +139,10 @@ def parse_prediction(message_text, phone="", paid=False):
 
     # Store or update the prediction
     conn = get_db_connection()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=DictCursor)
     c.execute('''
         INSERT INTO predictions (user_id, match_id, score_a, score_b, paid)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT(user_id, match_id) DO UPDATE SET
             score_a=excluded.score_a,
             score_b=excluded.score_b,
@@ -162,28 +175,28 @@ def calculate_score(predicted_a, predicted_b, actual_a, actual_b):
 
 def delete_match(match_id):
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('DELETE FROM predictions WHERE match_id = ?', (match_id,))
-    c.execute('DELETE FROM matches WHERE match_id = ?', (match_id,))
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute('DELETE FROM predictions WHERE match_id = %s', (match_id,))
+    c.execute('DELETE FROM matches WHERE match_id = %s', (match_id,))
     conn.commit()
     conn.close()
 
 def delete_prediction(user_id, match_id):
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('DELETE FROM predictions WHERE user_id = ? AND match_id = ?', (user_id, match_id))
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute('DELETE FROM predictions WHERE user_id = %s AND match_id = %s', (user_id, match_id))
     conn.commit()
     conn.close()
 
 def update_match_result(match_id, score_a, score_b):
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,))
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute('SELECT * FROM matches WHERE match_id = %s', (match_id,))
     if c.fetchone():
         c.execute('''
             UPDATE matches
-            SET score_a = ?, score_b = ?, completed = 1
-            WHERE match_id = ?
+            SET score_a = %s, score_b = %s, completed = TRUE
+            WHERE match_id = %s
         ''', (score_a, score_b, match_id))
         conn.commit()
         conn.close()
@@ -193,8 +206,9 @@ def update_match_result(match_id, score_a, score_b):
 
 def calculate_prize_split(match_id):
     conn = get_db_connection()
-    c = conn.cursor()
-    match = c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,)).fetchone()
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute('SELECT * FROM matches WHERE match_id = %s', (match_id,))
+    match = c.fetchone()
 
     if not match or not match["completed"]:
         conn.close()
@@ -203,7 +217,8 @@ def calculate_prize_split(match_id):
     bet_amount = match["bet_amount"]
 
     # Find all predictions for this match
-    match_predictions = c.execute('SELECT * FROM predictions WHERE match_id = ?', (match_id,)).fetchall()
+    c.execute('SELECT * FROM predictions WHERE match_id = %s', (match_id,))
+    match_predictions = c.fetchall()
 
     # Total pot is number of participants * bet amount
     total_pot = len(match_predictions) * bet_amount
@@ -234,17 +249,20 @@ def calculate_prize_split(match_id):
 
 def generate_ranking():
     conn = get_db_connection()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=DictCursor)
 
     # Fetch all users initially to ensure everyone is in the ranking with at least 0
-    all_users = {row["user_id"]: dict(row) for row in c.execute('SELECT user_id, name, score FROM users').fetchall()}
+    c.execute('SELECT user_id, name, score FROM users')
+    all_users = {row["user_id"]: dict(row) for row in c.fetchall()}
     for u in all_users.values():
         u["score"] = 0 # Calculate from scratch in-memory
 
     # Recalculate based on completed matches and predictions
-    completed_matches = c.execute('SELECT * FROM matches WHERE completed = 1').fetchall()
+    c.execute('SELECT * FROM matches WHERE completed = TRUE')
+    completed_matches = c.fetchall()
     for match in completed_matches:
-        preds = c.execute('SELECT * FROM predictions WHERE match_id = ?', (match["match_id"],)).fetchall()
+        c.execute('SELECT * FROM predictions WHERE match_id = %s', (match["match_id"],))
+        preds = c.fetchall()
         for pred in preds:
             points = calculate_score(
                 pred["score_a"], pred["score_b"],
@@ -274,10 +292,11 @@ def render_dashboard():
     admin_pw = st.sidebar.text_input("Senha de Administrador", type="password")
 
     conn = get_db_connection()
-    c = conn.cursor()
+    c = conn.cursor(cursor_factory=DictCursor)
 
     # Fetch matches
-    all_matches = c.execute('SELECT * FROM matches').fetchall()
+    c.execute('SELECT * FROM matches')
+    all_matches = c.fetchall()
     matches_dict = {m["match_id"]: dict(m) for m in all_matches}
     active_matches = {mid: m for mid, m in matches_dict.items() if not m["completed"]}
 
@@ -317,7 +336,8 @@ def render_dashboard():
 
         # Deletar Palpite
         st.sidebar.subheader("Deletar Palpite")
-        preds_for_del = c.execute('SELECT p.user_id, p.match_id, u.name, m.team_a, m.team_b FROM predictions p JOIN users u ON p.user_id = u.user_id JOIN matches m ON p.match_id = m.match_id').fetchall()
+        c.execute('SELECT p.user_id, p.match_id, u.name, m.team_a, m.team_b FROM predictions p JOIN users u ON p.user_id = u.user_id JOIN matches m ON p.match_id = m.match_id')
+        preds_for_del = c.fetchall()
         if preds_for_del:
             pred_options = {f"{p['user_id']}_{p['match_id']}": p for p in preds_for_del}
             pred_to_delete_key = st.sidebar.selectbox(
@@ -403,7 +423,8 @@ def render_dashboard():
     with col_preds:
         st.header("📊 Palpites Registrados")
 
-        preds_data = c.execute('SELECT * FROM predictions').fetchall()
+        c.execute('SELECT * FROM predictions')
+        preds_data = c.fetchall()
         if preds_data:
             df_preds = pd.DataFrame([dict(p) for p in preds_data])
             st.dataframe(df_preds, width="stretch")
@@ -414,7 +435,8 @@ def render_dashboard():
     st.header("💰 Status dos Prêmios (Pix)")
 
     # Pre-fetch all users to map IDs to names
-    all_users = {row["user_id"]: row["name"] for row in c.execute('SELECT user_id, name FROM users').fetchall()}
+    c.execute('SELECT user_id, name FROM users')
+    all_users = {row["user_id"]: row["name"] for row in c.fetchall()}
 
     for mid, match in matches_dict.items():
         if match["completed"]:
