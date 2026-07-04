@@ -16,3 +16,6 @@ data.json
 *.gif
 test_secrets.py
 patch_app.py
+
+# Streamlit secrets (nunca commitar a senha real do banco)
+.streamlit/secrets.toml

@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import psycopg2
 from psycopg2.extras import DictCursor
+from urllib.parse import urlparse, urlunparse, quote
 
 # Load database URL from Streamlit Secrets or environment variables
 DB_URL = os.environ.get("DATABASE_URL")
@@ -15,30 +16,144 @@ try:
 except Exception:
     pass
 
+# ---------------------------------------------------------
+# Connection handling
+#
+# O Supabase desativou o IPv4 direto. O host direto
+# (db.<ref>.supabase.co) só responde por IPv6, e o Streamlit Cloud
+# normalmente só tem IPv4 -> por isso a conexão falha.
+#
+# A solução é usar o Connection Pooler (Supavisor), que atende por
+# IPv4. Em vez de exigir que o usuário troque a URL manualmente, o app
+# converte automaticamente uma URL direta na URL do pooler e tenta essa
+# primeiro. A região pode ser informada via secret/env SUPABASE_REGION;
+# caso contrário, usamos a região deste projeto como padrão.
+# ---------------------------------------------------------
+
+DEFAULT_SUPABASE_REGION = "us-west-2"
+_DIRECT_HOST_RE = re.compile(r"^db\.([a-z0-9]+)\.supabase\.co$", re.IGNORECASE)
+
+
+def _get_region():
+    region = os.environ.get("SUPABASE_REGION")
+    if region:
+        return region
+    try:
+        if "SUPABASE_REGION" in st.secrets:
+            return st.secrets["SUPABASE_REGION"]
+    except Exception:
+        pass
+    return DEFAULT_SUPABASE_REGION
+
+
+def build_pooler_url(url, port=5432):
+    """Converte uma URL de conexão *direta* do Supabase para a URL do
+    Connection Pooler (Supavisor), que responde por IPv4.
+
+    Retorna None se a URL não for uma URL direta do Supabase."""
+    try:
+        parts = urlparse(url)
+    except Exception:
+        return None
+
+    if not parts.hostname:
+        return None
+
+    match = _DIRECT_HOST_RE.match(parts.hostname)
+    if not match:
+        return None  # Não é uma URL direta do Supabase; nada a converter.
+
+    ref = match.group(1)
+    region = _get_region()
+    user = f"postgres.{ref}"
+    password = parts.password or ""
+    host = f"aws-0-{region}.pooler.supabase.com"
+
+    netloc = f"{quote(user)}:{quote(password)}@{host}:{port}"
+    path = parts.path or "/postgres"
+    return urlunparse((parts.scheme, netloc, path, "", parts.query, ""))
+
+
+def _candidate_urls():
+    """Lista ordenada de URLs a tentar. Para URLs diretas do Supabase,
+    tentamos o Session Pooler (IPv4) primeiro, depois a direta, depois o
+    Transaction Pooler."""
+    if not DB_URL:
+        return []
+
+    parts = urlparse(DB_URL)
+    is_direct = bool(parts.hostname and _DIRECT_HOST_RE.match(parts.hostname))
+
+    urls = []
+    if is_direct:
+        for candidate in (
+            build_pooler_url(DB_URL, 5432),  # Session pooler (recomendado p/ Streamlit)
+            DB_URL,                          # Conexão direta (funciona onde há IPv6)
+            build_pooler_url(DB_URL, 6543),  # Transaction pooler
+        ):
+            if candidate and candidate not in urls:
+                urls.append(candidate)
+    else:
+        urls.append(DB_URL)
+    return urls
+
+
+# Guarda a URL que funcionou para evitar retentar todas a cada chamada.
+_WORKING_URL = {"value": None}
+
+
+def _render_connection_error():
+    """Mostra a ajuda de conexão apenas uma vez por execução."""
+    try:
+        if st.session_state.get("_conn_error_shown"):
+            return
+        st.session_state["_conn_error_shown"] = True
+    except Exception:
+        pass
+
+    st.error("⚠️ **Erro de Conexão com o Supabase:** O aplicativo não conseguiu se conectar ao banco de dados.")
+    st.warning("O Supabase desativou o suporte direto a IPv4 recentemente. Como o Streamlit Cloud muitas vezes precisa de IPv4, você precisa usar o **Connection Pooler** do Supabase na sua `DATABASE_URL` em vez da URL direta.")
+    st.info("Para corrigir isso:\n\n"
+            "1. Vá no painel do Supabase do seu projeto.\n"
+            "2. Clique em **Project Settings** (engrenagem) -> **Database**.\n"
+            "3. Role para baixo até **Connection pooling**.\n"
+            "4. Copie a string de conexão (ela costuma ter a porta `6543`/`5432` e usar o host `aws-0...pooler.supabase.com`).\n"
+            "5. Troque a `DATABASE_URL` no Streamlit Secrets por essa nova URL do pooler, certificando-se de colocar sua senha onde estiver `[YOUR-PASSWORD]`.")
+
+
 def get_db_connection():
     if not DB_URL:
         return None
-    try:
-        conn = psycopg2.connect(DB_URL)
-        return conn
-    except psycopg2.OperationalError as e:
-        if "Network is unreachable" in str(e) or "could not translate host name" in str(e) or "connection to server at" in str(e):
-            st.error("⚠️ **Erro de Conexão com o Supabase:** O aplicativo não conseguiu se conectar ao banco de dados.")
-            st.warning("O Supabase desativou o suporte direto a IPv4 recentemente. Como o Streamlit Cloud muitas vezes precisa de IPv4, você precisa usar o **Connection Pooler** do Supabase na sua `DATABASE_URL` em vez da URL direta.")
-            st.info("Para corrigir isso:\n\n"
-                    "1. Vá no painel do Supabase do seu projeto.\n"
-                    "2. Clique em **Project Settings** (engrenagem) -> **Database**.\n"
-                    "3. Role para baixo até **Connection pooling**.\n"
-                    "4. Copie a string de conexão (ela costuma ter a porta `6543` e usar o host `aws-0...pooler.supabase.com`).\n"
-                    "5. Troque a `DATABASE_URL` no Streamlit Secrets por essa nova URL do pooler, certificando-se de colocar sua senha onde estiver `[YOUR-PASSWORD]`.")
-            # st.stop() intentionally removed here so the app doesn't crash during tests
-            return None
-        else:
-            st.error(f"Erro ao conectar ao banco de dados: {e}")
-            return None
-    except Exception as e:
-        st.error(f"Erro desconhecido ao conectar ao banco: {e}")
-        return None
+
+    candidates = _candidate_urls()
+    # Tenta primeiro a URL que já funcionou nesta sessão.
+    if _WORKING_URL["value"] in candidates:
+        candidates = [_WORKING_URL["value"]] + [u for u in candidates if u != _WORKING_URL["value"]]
+
+    last_error = None
+    for url in candidates:
+        try:
+            conn = psycopg2.connect(url, connect_timeout=10)
+            _WORKING_URL["value"] = url
+            return conn
+        except Exception as e:  # noqa: BLE001 - tentamos o próximo candidato
+            last_error = e
+            continue
+
+    # Todos os candidatos falharam.
+    err_text = str(last_error) if last_error else ""
+    network_signals = (
+        "Network is unreachable",
+        "could not translate host name",
+        "connection to server at",
+        "timeout expired",
+        "Connection refused",
+    )
+    if any(sig in err_text for sig in network_signals):
+        _render_connection_error()
+    else:
+        st.error(f"Erro ao conectar ao banco de dados: {last_error}")
+    return None
 
 @st.cache_resource
 def init_db():
@@ -453,7 +568,7 @@ def render_dashboard():
         ranking = generate_ranking()
         if ranking:
             df_ranking = pd.DataFrame(ranking)
-            st.dataframe(df_ranking, width="stretch")
+            st.dataframe(df_ranking, use_container_width=True)
         else:
             st.info("Nenhum usuário no ranking ainda.")
 
@@ -464,7 +579,7 @@ def render_dashboard():
         preds_data = c.fetchall()
         if preds_data:
             df_preds = pd.DataFrame([dict(p) for p in preds_data])
-            st.dataframe(df_preds, width="stretch")
+            st.dataframe(df_preds, use_container_width=True)
         else:
             st.info("Nenhum palpite registrado.")
 
