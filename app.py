@@ -6,7 +6,6 @@ import psycopg2
 from psycopg2.extras import DictCursor
 
 # Load database URL from Streamlit Secrets or environment variables
-# Load database URL from Streamlit Secrets or environment variables
 DB_URL = os.environ.get("DATABASE_URL")
 try:
     if "SUPABASE_DB_URL" in st.secrets:
@@ -17,6 +16,8 @@ except Exception:
     pass
 
 def get_db_connection():
+    if not DB_URL:
+        return None
     try:
         conn = psycopg2.connect(DB_URL)
         return conn
@@ -30,18 +31,22 @@ def get_db_connection():
                     "3. Role para baixo até **Connection pooling**.\n"
                     "4. Copie a string de conexão (ela costuma ter a porta `6543` e usar o host `aws-0...pooler.supabase.com`).\n"
                     "5. Troque a `DATABASE_URL` no Streamlit Secrets por essa nova URL do pooler, certificando-se de colocar sua senha onde estiver `[YOUR-PASSWORD]`.")
-            st.stop()
+            # st.stop() intentionally removed here so the app doesn't crash during tests
+            return None
         else:
             st.error(f"Erro ao conectar ao banco de dados: {e}")
-            st.stop()
+            return None
+    except Exception as e:
+        st.error(f"Erro desconhecido ao conectar ao banco: {e}")
+        return None
 
 @st.cache_resource
 def init_db():
     if not DB_URL:
-        return
+        return False
     conn = get_db_connection()
     if conn is None:
-        return
+        return False
     c = conn.cursor()
 
     # Create users table
@@ -88,17 +93,20 @@ def init_db():
 
     conn.commit()
     conn.close()
+    return True
 
 # Initialize DB on app start
 if not DB_URL:
-    st.error("Configure a DATABASE_URL no .env ou no .streamlit/secrets.toml")
-    st.stop()
-init_db()
+    st.error("⚠️ **Erro de Configuração:** O aplicativo não encontrou a URL do banco de dados.")
+    st.info("Configure a `DATABASE_URL` no `.streamlit/secrets.toml` ou nas variáveis de ambiente.")
+else:
+    init_db()
 
 def get_or_create_user(name, phone=""):
     # Simple ID generation based on name
     user_id = name.lower().replace(" ", "_")
     conn = get_db_connection()
+    if not conn: return user_id
     c = conn.cursor(cursor_factory=DictCursor)
     c.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
     user = c.fetchone()
@@ -116,6 +124,7 @@ def get_or_create_user(name, phone=""):
 def create_match(team_a, team_b, bet_amount=0.0):
     match_id = f"{team_a}_{team_b}".lower().replace(" ", "_")
     conn = get_db_connection()
+    if not conn: return match_id
     c = conn.cursor(cursor_factory=DictCursor)
     c.execute('SELECT * FROM matches WHERE match_id = %s', (match_id,))
     if not c.fetchone():
@@ -157,6 +166,7 @@ def parse_prediction(message_text, phone="", paid=False):
 
     # Store or update the prediction
     conn = get_db_connection()
+    if not conn: return False, "Banco de dados indisponível."
     c = conn.cursor(cursor_factory=DictCursor)
     c.execute('''
         INSERT INTO predictions (user_id, match_id, score_a, score_b, paid)
@@ -193,6 +203,7 @@ def calculate_score(predicted_a, predicted_b, actual_a, actual_b):
 
 def delete_match(match_id):
     conn = get_db_connection()
+    if not conn: return
     c = conn.cursor(cursor_factory=DictCursor)
     c.execute('DELETE FROM predictions WHERE match_id = %s', (match_id,))
     c.execute('DELETE FROM matches WHERE match_id = %s', (match_id,))
@@ -201,6 +212,7 @@ def delete_match(match_id):
 
 def delete_prediction(user_id, match_id):
     conn = get_db_connection()
+    if not conn: return
     c = conn.cursor(cursor_factory=DictCursor)
     c.execute('DELETE FROM predictions WHERE user_id = %s AND match_id = %s', (user_id, match_id))
     conn.commit()
@@ -208,6 +220,7 @@ def delete_prediction(user_id, match_id):
 
 def update_match_result(match_id, score_a, score_b):
     conn = get_db_connection()
+    if not conn: return False
     c = conn.cursor(cursor_factory=DictCursor)
     c.execute('SELECT * FROM matches WHERE match_id = %s', (match_id,))
     if c.fetchone():
@@ -224,6 +237,7 @@ def update_match_result(match_id, score_a, score_b):
 
 def calculate_prize_split(match_id):
     conn = get_db_connection()
+    if not conn: return 0, 0, []
     c = conn.cursor(cursor_factory=DictCursor)
     c.execute('SELECT * FROM matches WHERE match_id = %s', (match_id,))
     match = c.fetchone()
@@ -267,6 +281,7 @@ def calculate_prize_split(match_id):
 
 def generate_ranking():
     conn = get_db_connection()
+    if not conn: return []
     c = conn.cursor(cursor_factory=DictCursor)
 
     # Fetch all users initially to ensure everyone is in the ranking with at least 0
@@ -310,6 +325,10 @@ def render_dashboard():
     admin_pw = st.sidebar.text_input("Senha de Administrador", type="password")
 
     conn = get_db_connection()
+    if not conn:
+        st.error("Aplicativo em modo offline devido a erro de banco de dados. Configure sua DATABASE_URL no Streamlit Secrets de acordo com as instruções acima e reinicie.")
+        st.stop()
+
     c = conn.cursor(cursor_factory=DictCursor)
 
     # Fetch matches
