@@ -49,12 +49,22 @@ defina a região com:
 SUPABASE_REGION = "sua-regiao"   # ex.: sa-east-1
 ```
 
+### Diagnóstico
+
+Se ainda houver erro de conexão, o app agora mostra a **causa provável**
+(senha incorreta, região/tenant errado ou rede/IPv4) e um expander
+**"Diagnóstico de conexão"** listando cada tentativa (host/porta/usuário, **com
+a senha sempre ocultada**). Isso torna trivial identificar o que corrigir.
+
 ## Variáveis suportadas
 
-| Chave (secrets/env)                | Descrição                                              |
-| ---------------------------------- | ------------------------------------------------------ |
-| `DATABASE_URL` / `SUPABASE_DB_URL` | String de conexão do PostgreSQL (use a URL do pooler). |
-| `SUPABASE_REGION`                  | Região usada ao converter uma URL direta em pooler.    |
+| Chave (secrets/env)                | Descrição                                               |
+| ---------------------------------- | ------------------------------------------------------- |
+| `DATABASE_URL` / `SUPABASE_DB_URL` | String de conexão do PostgreSQL (use a URL do pooler).  |
+| `SUPABASE_REGION`                  | Região usada ao converter uma URL direta em pooler.     |
+| `ADMIN_PASSWORD`                   | Senha do painel de administração (padrão `5075`).       |
+
+O `sslmode=require` é adicionado automaticamente à conexão (o Supabase exige SSL).
 
 ## Testes
 
