@@ -160,6 +160,21 @@ def calculate_score(predicted_a, predicted_b, actual_a, actual_b):
 
     return 0
 
+def delete_match(match_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('DELETE FROM predictions WHERE match_id = ?', (match_id,))
+    c.execute('DELETE FROM matches WHERE match_id = ?', (match_id,))
+    conn.commit()
+    conn.close()
+
+def delete_prediction(user_id, match_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('DELETE FROM predictions WHERE user_id = ? AND match_id = ?', (user_id, match_id))
+    conn.commit()
+    conn.close()
+
 def update_match_result(match_id, score_a, score_b):
     conn = get_db_connection()
     c = conn.cursor()
@@ -288,6 +303,34 @@ def render_dashboard():
                 if st.sidebar.button("Encerrar Partida e Calcular"):
                     update_match_result(match_to_finish, score_a, score_b)
                     st.sidebar.success("Partida encerrada!")
+                    st.rerun()
+
+        # Deletar Partida
+        st.sidebar.subheader("Deletar Partida")
+        if matches_dict:
+            match_to_delete = st.sidebar.selectbox("Selecione a partida para deletar", options=list(matches_dict.keys()), key="del_match_select")
+            if match_to_delete:
+                if st.sidebar.button("Deletar Partida", type="primary"):
+                    delete_match(match_to_delete)
+                    st.sidebar.success("Partida e palpites associados deletados!")
+                    st.rerun()
+
+        # Deletar Palpite
+        st.sidebar.subheader("Deletar Palpite")
+        preds_for_del = c.execute('SELECT p.user_id, p.match_id, u.name, m.team_a, m.team_b FROM predictions p JOIN users u ON p.user_id = u.user_id JOIN matches m ON p.match_id = m.match_id').fetchall()
+        if preds_for_del:
+            pred_options = {f"{p['user_id']}_{p['match_id']}": p for p in preds_for_del}
+            pred_to_delete_key = st.sidebar.selectbox(
+                "Selecione o palpite para deletar",
+                options=list(pred_options.keys()),
+                format_func=lambda k: f"{pred_options[k]['name']} - {pred_options[k]['team_a']}x{pred_options[k]['team_b']}",
+                key="del_pred_select"
+            )
+            if pred_to_delete_key:
+                if st.sidebar.button("Deletar Palpite", type="primary"):
+                    p = pred_options[pred_to_delete_key]
+                    delete_prediction(p['user_id'], p['match_id'])
+                    st.sidebar.success("Palpite deletado!")
                     st.rerun()
     else:
         st.sidebar.info("Área restrita. Insira a senha para liberar o painel.")
