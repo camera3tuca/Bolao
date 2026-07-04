@@ -6,32 +6,42 @@ import psycopg2
 from psycopg2.extras import DictCursor
 
 # Load database URL from Streamlit Secrets or environment variables
+# Load database URL from Streamlit Secrets or environment variables
 DB_URL = os.environ.get("DATABASE_URL")
 try:
-    if hasattr(st.secrets, "has_key"):
-        if st.secrets.has_key("SUPABASE_DB_URL"):
-            DB_URL = st.secrets["SUPABASE_DB_URL"]
-        elif st.secrets.has_key("DATABASE_URL"):
-            DB_URL = st.secrets["DATABASE_URL"]
-    else:
-        if "SUPABASE_DB_URL" in st.secrets:
-            DB_URL = st.secrets["SUPABASE_DB_URL"]
-        elif "DATABASE_URL" in st.secrets:
-            DB_URL = st.secrets["DATABASE_URL"]
-except FileNotFoundError:
-    pass
+    if "SUPABASE_DB_URL" in st.secrets:
+        DB_URL = st.secrets["SUPABASE_DB_URL"]
+    elif "DATABASE_URL" in st.secrets:
+        DB_URL = st.secrets["DATABASE_URL"]
 except Exception:
     pass
 
 def get_db_connection():
-    conn = psycopg2.connect(DB_URL)
-    return conn
+    try:
+        conn = psycopg2.connect(DB_URL)
+        return conn
+    except psycopg2.OperationalError as e:
+        if "Network is unreachable" in str(e) or "could not translate host name" in str(e) or "connection to server at" in str(e):
+            st.error("⚠️ **Erro de Conexão com o Supabase:** O aplicativo não conseguiu se conectar ao banco de dados.")
+            st.warning("O Supabase desativou o suporte direto a IPv4 recentemente. Como o Streamlit Cloud muitas vezes precisa de IPv4, você precisa usar o **Connection Pooler** do Supabase na sua `DATABASE_URL` em vez da URL direta.")
+            st.info("Para corrigir isso:\n\n"
+                    "1. Vá no painel do Supabase do seu projeto.\n"
+                    "2. Clique em **Project Settings** (engrenagem) -> **Database**.\n"
+                    "3. Role para baixo até **Connection pooling**.\n"
+                    "4. Copie a string de conexão (ela costuma ter a porta `6543` e usar o host `aws-0...pooler.supabase.com`).\n"
+                    "5. Troque a `DATABASE_URL` no Streamlit Secrets por essa nova URL do pooler, certificando-se de colocar sua senha onde estiver `[YOUR-PASSWORD]`.")
+            st.stop()
+        else:
+            st.error(f"Erro ao conectar ao banco de dados: {e}")
+            st.stop()
 
 @st.cache_resource
 def init_db():
     if not DB_URL:
         return
     conn = get_db_connection()
+    if conn is None:
+        return
     c = conn.cursor()
 
     # Create users table
