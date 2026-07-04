@@ -8,10 +8,18 @@ from psycopg2.extras import DictCursor
 # Load database URL from Streamlit Secrets or environment variables
 DB_URL = os.environ.get("DATABASE_URL")
 try:
-    if "SUPABASE_DB_URL" in st.secrets:
-        DB_URL = st.secrets["SUPABASE_DB_URL"]
-    elif "DATABASE_URL" in st.secrets:
-        DB_URL = st.secrets["DATABASE_URL"]
+    if hasattr(st.secrets, "has_key"):
+        if st.secrets.has_key("SUPABASE_DB_URL"):
+            DB_URL = st.secrets["SUPABASE_DB_URL"]
+        elif st.secrets.has_key("DATABASE_URL"):
+            DB_URL = st.secrets["DATABASE_URL"]
+    else:
+        if "SUPABASE_DB_URL" in st.secrets:
+            DB_URL = st.secrets["SUPABASE_DB_URL"]
+        elif "DATABASE_URL" in st.secrets:
+            DB_URL = st.secrets["DATABASE_URL"]
+except FileNotFoundError:
+    pass
 except Exception:
     pass
 
