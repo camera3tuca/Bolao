@@ -2,7 +2,21 @@
 
 Aplicativo em [Streamlit](https://streamlit.io/) para gerenciar um bolão de
 futebol: cadastro de palpites, ranking automático e divisão de prêmios (Pix).
-Os dados ficam em um banco PostgreSQL do [Supabase](https://supabase.com/).
+Os dados ficam em um banco PostgreSQL ([Neon](https://neon.tech) ou
+[Supabase](https://supabase.com/)).
+
+## Funcionalidades
+
+- **Layout wide com abas** (Registrar Palpite · Ranking · Palpites · Prêmios),
+  otimizado para tablet, com indicadores (KPIs) no topo.
+- **Registro de palpites** com data/hora (horário de Brasília) e confirmação
+  de pagamento (Pix).
+- **Ranking automático**: 3 pontos por placar exato, 1 por acertar o vencedor.
+- **Controle de pagamento**: status Pago/Pendente, filtro na lista de palpites,
+  confirmação pelo admin e **resumo de arrecadação** por partida (esperado ×
+  confirmado × pendente).
+- **Painel de administração** (senha): criar/encerrar/deletar partidas,
+  confirmar pagamentos e deletar palpites.
 
 ## Como rodar localmente
 

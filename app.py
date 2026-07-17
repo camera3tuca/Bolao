@@ -1,26 +1,59 @@
 import re
 import os
+from datetime import datetime, timezone, timedelta
 import streamlit as st
 import pandas as pd
 import psycopg2
 from psycopg2.extras import DictCursor
 from urllib.parse import urlparse, urlunparse, quote, parse_qsl, urlencode
 
+# Fuso de Brasília (BRT, UTC-3). O Brasil não usa mais horário de verão
+# desde 2019, então o offset fixo é correto o ano todo.
+BRT = timezone(timedelta(hours=-3))
+
+
+def format_brt(dt):
+    """Formata um datetime (timestamptz) no horário de Brasília. None -> '—'."""
+    if dt is None:
+        return "—"
+    try:
+        if isinstance(dt, str):
+            return dt
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(BRT).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return "—"
+
+
+# set_page_config PRECISA ser o primeiro comando Streamlit do script (antes
+# de qualquer acesso a st.secrets abaixo).
+st.set_page_config(page_title="Bolão de Futebol", page_icon="⚽", layout="wide")
+
 
 # ---------------------------------------------------------
 # Configuração (Secrets / variáveis de ambiente)
 # ---------------------------------------------------------
+_SECRETS_CACHE = None
+
+
+def _secrets_dict():
+    """Carrega st.secrets uma única vez; retorna {} se não houver arquivo."""
+    global _SECRETS_CACHE
+    if _SECRETS_CACHE is None:
+        try:
+            _SECRETS_CACHE = dict(st.secrets)
+        except Exception:
+            _SECRETS_CACHE = {}
+    return _SECRETS_CACHE
+
+
 def _secret(name, default=None):
     """Lê um valor de os.environ ou de st.secrets, nessa ordem."""
     value = os.environ.get(name)
     if value:
         return value
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    return default
+    return _secrets_dict().get(name, default)
 
 
 DB_URL = _secret("SUPABASE_DB_URL") or _secret("DATABASE_URL")
@@ -174,7 +207,10 @@ def _connect(url):
     last = None
     for attempt in range(_MAX_ATTEMPTS_PER_URL):
         try:
-            return psycopg2.connect(url, connect_timeout=_CONNECT_TIMEOUT)
+            # client_encoding=utf8 garante acentos (nomes com ã, ç, ...)
+            # independentemente do locale do servidor.
+            return psycopg2.connect(url, connect_timeout=_CONNECT_TIMEOUT,
+                                    client_encoding="utf8")
         except Exception as exc:  # noqa: BLE001
             last = exc
             if attempt + 1 < _MAX_ATTEMPTS_PER_URL and \
@@ -218,7 +254,7 @@ def get_db_connection():
                         if not alt or alt in [a for a, _ in attempts]:
                             continue
                         try:
-                            conn = psycopg2.connect(alt, connect_timeout=_CONNECT_TIMEOUT)
+                            conn = _connect(alt)
                             _WORKING["url"] = alt
                             _DIAG.update(attempts=attempts, kind=None)
                             return conn
@@ -285,6 +321,10 @@ def init_db():
                         FOREIGN KEY (match_id) REFERENCES matches (match_id)
                     )
                 ''')
+                # Data/hora do palpite. Palpites antigos ficam NULL (mostram
+                # '—'); novos recebem now() via o DEFAULT abaixo.
+                c.execute('ALTER TABLE predictions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;')
+                c.execute('ALTER TABLE predictions ALTER COLUMN created_at SET DEFAULT now();')
         return True
     finally:
         conn.close()
@@ -359,12 +399,13 @@ def parse_prediction(message_text, phone="", paid=False):
     try:
         c = conn.cursor(cursor_factory=DictCursor)
         c.execute('''
-            INSERT INTO predictions (user_id, match_id, score_a, score_b, paid)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO predictions (user_id, match_id, score_a, score_b, paid, created_at)
+            VALUES (%s, %s, %s, %s, %s, now())
             ON CONFLICT(user_id, match_id) DO UPDATE SET
                 score_a=excluded.score_a,
                 score_b=excluded.score_b,
-                paid=excluded.paid
+                paid=excluded.paid,
+                created_at=now()
         ''', (user_id, match_id, score_a, score_b, paid))
         conn.commit()
     finally:
@@ -410,6 +451,40 @@ def delete_prediction(user_id, match_id):
         c = conn.cursor(cursor_factory=DictCursor)
         c.execute('DELETE FROM predictions WHERE user_id = %s AND match_id = %s', (user_id, match_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def update_payment(user_id, match_id, paid):
+    """Marca/desmarca a confirmação de pagamento de um palpite (admin)."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        c = conn.cursor(cursor_factory=DictCursor)
+        c.execute('UPDATE predictions SET paid = %s WHERE user_id = %s AND match_id = %s',
+                  (bool(paid), user_id, match_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_predictions_detailed():
+    """Palpites com dados do usuário e da partida, mais recentes primeiro."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        c = conn.cursor(cursor_factory=DictCursor)
+        c.execute('''
+            SELECT p.user_id, p.match_id, p.score_a, p.score_b, p.paid, p.created_at,
+                   u.name, u.phone, m.team_a, m.team_b, m.completed, m.bet_amount
+            FROM predictions p
+            JOIN users u ON p.user_id = u.user_id
+            JOIN matches m ON p.match_id = m.match_id
+            ORDER BY p.created_at DESC NULLS LAST
+        ''')
+        return [dict(r) for r in c.fetchall()]
     finally:
         conn.close()
 
@@ -540,12 +615,19 @@ def _render_connection_error():
 # ---------------------------------------------------------
 # Interface Streamlit
 # ---------------------------------------------------------
+def _match_label(match):
+    label = f"{match['team_a']} x {match['team_b']}"
+    if match.get("completed"):
+        label = f"✅ {label} ({match['score_a']} x {match['score_b']})"
+    return label
+
+
 def render_dashboard():
-    st.set_page_config(page_title="Bolão de Futebol", page_icon="⚽")
     st.title("⚽ Bolão de Futebol - Dashboard")
 
     st.sidebar.header("Administração")
     admin_pw = st.sidebar.text_input("Senha de Administrador", type="password")
+    is_admin = admin_pw == ADMIN_PASSWORD
 
     if not DB_URL:
         st.error("⚠️ **Erro de Configuração:** o aplicativo não encontrou a URL do banco de dados.")
@@ -565,28 +647,32 @@ def render_dashboard():
 
     c = conn.cursor(cursor_factory=DictCursor)
 
-    # Fetch matches
-    c.execute('SELECT * FROM matches')
-    all_matches = c.fetchall()
-    matches_dict = {m["match_id"]: dict(m) for m in all_matches}
+    # Partidas (abertas primeiro) e palpites detalhados.
+    c.execute('SELECT * FROM matches ORDER BY completed, team_a')
+    matches_dict = {m["match_id"]: dict(m) for m in c.fetchall()}
     active_matches = {mid: m for mid, m in matches_dict.items() if not m["completed"]}
+    detailed = get_predictions_detailed()
 
-    if admin_pw == ADMIN_PASSWORD:
-        # Adicionar Partida e Aposta
+    # -----------------------------------------------------
+    # Painel de administração (barra lateral)
+    # -----------------------------------------------------
+    if is_admin:
+        st.sidebar.success("✅ Painel de administração liberado.")
+
         st.sidebar.subheader("Criar/Atualizar Partida")
         team_a_input = st.sidebar.text_input("Time A", "Brasil")
         team_b_input = st.sidebar.text_input("Time B", "Noruega")
         bet_val = st.sidebar.number_input("Valor da Aposta (R$)", min_value=0.0, value=10.0, step=1.0)
-
         if st.sidebar.button("Salvar Partida"):
             create_match(team_a_input, team_b_input, bet_amount=bet_val)
-            st.sidebar.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val})")
+            st.sidebar.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val:.2f})")
             st.rerun()
 
-        # Finalizar Partida
         st.sidebar.subheader("Finalizar Partida")
         if matches_dict:
-            match_to_finish = st.sidebar.selectbox("Selecione a partida para encerrar", options=list(matches_dict.keys()))
+            match_to_finish = st.sidebar.selectbox(
+                "Selecione a partida para encerrar", options=list(matches_dict.keys()),
+                format_func=lambda mid: _match_label(matches_dict[mid]))
             if match_to_finish:
                 score_a = st.sidebar.number_input(f"Gols {matches_dict[match_to_finish]['team_a']}", min_value=0, step=1)
                 score_b = st.sidebar.number_input(f"Gols {matches_dict[match_to_finish]['team_b']}", min_value=0, step=1)
@@ -595,125 +681,194 @@ def render_dashboard():
                     st.sidebar.success("Partida encerrada!")
                     st.rerun()
 
-        # Deletar Partida
+        st.sidebar.subheader("Confirmar Pagamento")
+        if detailed:
+            pay_options = {f"{d['user_id']}_{d['match_id']}": d for d in detailed}
+            pay_key = st.sidebar.selectbox(
+                "Selecione o palpite", options=list(pay_options.keys()),
+                format_func=lambda k: f"{'✅' if pay_options[k]['paid'] else '⏳'} {pay_options[k]['name']} · {pay_options[k]['team_a']}x{pay_options[k]['team_b']}",
+                key="pay_select")
+            if pay_key:
+                d = pay_options[pay_key]
+                if d["paid"]:
+                    if st.sidebar.button("Marcar como PENDENTE ⏳", key="pay_off"):
+                        update_payment(d["user_id"], d["match_id"], False)
+                        st.rerun()
+                else:
+                    if st.sidebar.button("Marcar como PAGO ✅", key="pay_on"):
+                        update_payment(d["user_id"], d["match_id"], True)
+                        st.rerun()
+        else:
+            st.sidebar.caption("Nenhum palpite registrado ainda.")
+
         st.sidebar.subheader("Deletar Partida")
         if matches_dict:
-            match_to_delete = st.sidebar.selectbox("Selecione a partida para deletar", options=list(matches_dict.keys()), key="del_match_select")
-            if match_to_delete:
-                if st.sidebar.button("Deletar Partida", type="primary"):
-                    delete_match(match_to_delete)
-                    st.sidebar.success("Partida e palpites associados deletados!")
-                    st.rerun()
+            match_to_delete = st.sidebar.selectbox(
+                "Selecione a partida para deletar", options=list(matches_dict.keys()),
+                format_func=lambda mid: _match_label(matches_dict[mid]), key="del_match_select")
+            if match_to_delete and st.sidebar.button("Deletar Partida", type="primary"):
+                delete_match(match_to_delete)
+                st.sidebar.success("Partida e palpites associados deletados!")
+                st.rerun()
 
-        # Deletar Palpite
         st.sidebar.subheader("Deletar Palpite")
-        c.execute('SELECT p.user_id, p.match_id, u.name, m.team_a, m.team_b FROM predictions p JOIN users u ON p.user_id = u.user_id JOIN matches m ON p.match_id = m.match_id')
-        preds_for_del = c.fetchall()
-        if preds_for_del:
-            pred_options = {f"{p['user_id']}_{p['match_id']}": p for p in preds_for_del}
-            pred_to_delete_key = st.sidebar.selectbox(
-                "Selecione o palpite para deletar",
-                options=list(pred_options.keys()),
-                format_func=lambda k: f"{pred_options[k]['name']} - {pred_options[k]['team_a']}x{pred_options[k]['team_b']}",
-                key="del_pred_select"
-            )
-            if pred_to_delete_key:
-                if st.sidebar.button("Deletar Palpite", type="primary"):
-                    p = pred_options[pred_to_delete_key]
-                    delete_prediction(p['user_id'], p['match_id'])
-                    st.sidebar.success("Palpite deletado!")
-                    st.rerun()
+        if detailed:
+            del_options = {f"{d['user_id']}_{d['match_id']}": d for d in detailed}
+            del_key = st.sidebar.selectbox(
+                "Selecione o palpite para deletar", options=list(del_options.keys()),
+                format_func=lambda k: f"{del_options[k]['name']} · {del_options[k]['team_a']}x{del_options[k]['team_b']}",
+                key="del_pred_select")
+            if del_key and st.sidebar.button("Deletar Palpite", type="primary", key="del_pred_btn"):
+                d = del_options[del_key]
+                delete_prediction(d["user_id"], d["match_id"])
+                st.sidebar.success("Palpite deletado!")
+                st.rerun()
     else:
         st.sidebar.info("Área restrita. Insira a senha para liberar o painel.")
 
-    # Formulário para Registrar Palpite
-    st.header("📝 Registrar Palpite")
+    # -----------------------------------------------------
+    # Indicadores (KPIs) no topo
+    # -----------------------------------------------------
+    total_palpites = len(detailed)
+    total_pagos = sum(1 for d in detailed if d["paid"])
+    participantes = len({d["user_id"] for d in detailed})
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("⚽ Partidas", len(matches_dict))
+    k2.metric("👥 Participantes", participantes)
+    k3.metric("📝 Palpites", total_palpites)
+    k4.metric("💸 Pagamentos", f"{total_pagos}/{total_palpites}" if total_palpites else "0/0")
 
-    if not active_matches:
-        st.info("Não há partidas abertas para receber palpites no momento.")
-    else:
-        with st.form("prediction_form"):
-            st.write("Insira seus dados para participar do bolão:")
-            user_name = st.text_input("Seu Nome")
-            user_phone = st.text_input("Seu Telefone (obrigatório, ex: 11999999999)")
+    tab_reg, tab_rank, tab_preds, tab_prizes = st.tabs(
+        ["📝 Registrar Palpite", "🏆 Ranking", "📊 Palpites", "💰 Prêmios (Pix)"])
 
-            selected_match_id = st.selectbox(
-                "Selecione a Partida",
-                options=list(active_matches.keys()),
-                format_func=lambda mid: f"{active_matches[mid]['team_a']} x {active_matches[mid]['team_b']}"
-            )
+    # ---------------- Aba: Registrar Palpite ----------------
+    with tab_reg:
+        st.subheader("📝 Registrar Palpite")
+        if not active_matches:
+            st.info("Não há partidas abertas para receber palpites no momento.")
+        else:
+            with st.form("prediction_form"):
+                st.write("Insira seus dados para participar do bolão:")
+                fc1, fc2 = st.columns(2)
+                user_name = fc1.text_input("Seu Nome")
+                user_phone = fc2.text_input("Seu WhatsApp (com DDD, ex: 11999999999)")
 
-            team_a_pred = active_matches[selected_match_id]['team_a'] if selected_match_id else ""
-            team_b_pred = active_matches[selected_match_id]['team_b'] if selected_match_id else ""
+                selected_match_id = st.selectbox(
+                    "Selecione a Partida", options=list(active_matches.keys()),
+                    format_func=lambda mid: f"{active_matches[mid]['team_a']} x {active_matches[mid]['team_b']}")
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write(f"**Time A: {team_a_pred}**")
-                score_a_pred = st.number_input("Gols Time A", min_value=0, step=1)
-            with col2:
-                st.write(f"**Time B: {team_b_pred}**")
-                score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
+                team_a_pred = active_matches[selected_match_id]['team_a'] if selected_match_id else ""
+                team_b_pred = active_matches[selected_match_id]['team_b'] if selected_match_id else ""
+                bet_amount = active_matches[selected_match_id]['bet_amount'] if selected_match_id else 0.0
+                if bet_amount:
+                    st.caption(f"💰 Valor da aposta desta partida: **R$ {bet_amount:.2f}**")
 
-            paid_checkbox = st.checkbox("Pagamento da aposta realizado?")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**{team_a_pred}**")
+                    score_a_pred = st.number_input("Gols Time A", min_value=0, step=1)
+                with col2:
+                    st.write(f"**{team_b_pred}**")
+                    score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
 
-            submit_btn = st.form_submit_button("Enviar Palpite")
+                paid_checkbox = st.checkbox("Já realizei o pagamento da aposta (Pix)")
+                submit_btn = st.form_submit_button("Enviar Palpite", type="primary")
 
-            if submit_btn:
-                # Validação simples de telefone brasileiro (10 a 11 dígitos)
-                phone_digits = re.sub(r'\D', '', user_phone)
-                phone_pattern = r'^\d{10,11}$'
-
-                if not user_name:
-                    st.error("Por favor, preencha o seu nome!")
-                elif not user_phone or not re.match(phone_pattern, phone_digits):
-                    st.error("Por favor, informe um número de WhatsApp válido (com DDD, somente números).")
-                elif not selected_match_id:
-                    st.error("Nenhuma partida selecionada!")
-                else:
-                    fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
-                    success, msg = parse_prediction(fake_msg, phone=user_phone, paid=paid_checkbox)
-
-                    if success:
-                        st.success(f"{msg} Entraremos em contato via {user_phone} se você ganhar!")
+                if submit_btn:
+                    phone_digits = re.sub(r'\D', '', user_phone)
+                    if not user_name:
+                        st.error("Por favor, preencha o seu nome!")
+                    elif not re.match(r'^\d{10,11}$', phone_digits):
+                        st.error("Por favor, informe um número de WhatsApp válido (com DDD, somente números).")
+                    elif not selected_match_id:
+                        st.error("Nenhuma partida selecionada!")
                     else:
-                        st.error(msg)
+                        fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
+                        success, msg = parse_prediction(fake_msg, phone=user_phone, paid=paid_checkbox)
+                        if success:
+                            registrado = format_brt(datetime.now(timezone.utc))
+                            pgto = "✅ pagamento confirmado" if paid_checkbox else "⏳ pagamento pendente"
+                            st.success(f"{msg}\n\n🕒 Registrado em {registrado} · {pgto}. "
+                                       f"Entraremos em contato via {user_phone} se você ganhar!")
+                            st.rerun()
+                        else:
+                            st.error(msg)
 
-    # Exibir Ranking e Palpites Ativos
-    col_rank, col_preds = st.columns(2)
-
-    with col_rank:
-        st.header("🏆 Ranking Geral")
+    # ---------------- Aba: Ranking ----------------
+    with tab_rank:
+        st.subheader("🏆 Ranking Geral")
         ranking = generate_ranking()
         if ranking:
-            st.dataframe(pd.DataFrame(ranking), use_container_width=True)
+            df_rank = pd.DataFrame(ranking).rename(columns={"name": "Nome", "score": "Pontos"})
+            df_rank.index = range(1, len(df_rank) + 1)
+            df_rank.index.name = "Posição"
+            st.dataframe(df_rank, use_container_width=True)
+            st.caption("Pontuação: **3** pontos por placar exato · **1** por acertar o vencedor/empate.")
         else:
             st.info("Nenhum usuário no ranking ainda.")
 
-    with col_preds:
-        st.header("📊 Palpites Registrados")
-        c.execute('SELECT * FROM predictions')
-        preds_data = c.fetchall()
-        if preds_data:
-            st.dataframe(pd.DataFrame([dict(p) for p in preds_data]), use_container_width=True)
+    # ---------------- Aba: Palpites ----------------
+    with tab_preds:
+        st.subheader("📊 Palpites Registrados")
+        if detailed:
+            filtro = st.radio("Filtrar por pagamento", ["Todos", "✅ Pagos", "⏳ Pendentes"],
+                              horizontal=True)
+            rows = []
+            for d in detailed:
+                if filtro == "✅ Pagos" and not d["paid"]:
+                    continue
+                if filtro == "⏳ Pendentes" and d["paid"]:
+                    continue
+                rows.append({
+                    "Registrado em": format_brt(d["created_at"]),
+                    "Nome": d["name"],
+                    "Partida": f"{d['team_a']} x {d['team_b']}",
+                    "Palpite": f"{d['score_a']} x {d['score_b']}",
+                    "Pagamento": "✅ Pago" if d["paid"] else "⏳ Pendente",
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhum palpite para este filtro.")
         else:
             st.info("Nenhum palpite registrado.")
 
-    # Exibir Status dos Bolões (Pix)
-    st.header("💰 Status dos Prêmios (Pix)")
+    # ---------------- Aba: Prêmios (Pix) ----------------
+    with tab_prizes:
+        st.subheader("💰 Status dos Prêmios (Pix)")
+        names_by_id = {d["user_id"]: d["name"] for d in detailed}
+        matches_with_preds = [mid for mid in matches_dict if any(d["match_id"] == mid for d in detailed)]
 
-    c.execute('SELECT user_id, name FROM users')
-    all_users = {row["user_id"]: row["name"] for row in c.fetchall()}
+        if not matches_with_preds:
+            st.info("Nenhuma partida com palpites ainda.")
+        for mid in matches_with_preds:
+            match = matches_dict[mid]
+            preds = [d for d in detailed if d["match_id"] == mid]
+            n = len(preds)
+            pagos = sum(1 for d in preds if d["paid"])
+            bet = match["bet_amount"] or 0.0
+            esperado = n * bet
+            confirmado = pagos * bet
 
-    for mid, match in matches_dict.items():
-        if match["completed"]:
-            tot_pot, prize_per, winners = calculate_prize_split(mid)
-            st.markdown(f"**{match['team_a']} {match['score_a']} x {match['score_b']} {match['team_b']}**")
-            st.write(f"Pote Total: **R$ {tot_pot:.2f}** | Prêmio por Ganhador: **R$ {prize_per:.2f}**")
-            if winners:
-                winner_names = [all_users.get(w, w) for w in winners]
-                st.write(f"Ganhadores: {', '.join(winner_names)}")
+            st.markdown(f"### {match['team_a']} x {match['team_b']}")
+            pc1, pc2, pc3, pc4 = st.columns(4)
+            pc1.metric("Participantes", n)
+            pc2.metric("Pote esperado", f"R$ {esperado:.2f}")
+            pc3.metric("Confirmado (pago)", f"R$ {confirmado:.2f}")
+            pc4.metric("Pendente", f"R$ {esperado - confirmado:.2f}",
+                       delta=(f"{n - pagos} sem pagar" if n - pagos else "tudo pago"),
+                       delta_color="inverse")
+
+            if match["completed"]:
+                tot_pot, prize_per, winners = calculate_prize_split(mid)
+                st.markdown(f"**Resultado: {match['team_a']} {match['score_a']} x {match['score_b']} {match['team_b']}**")
+                if winners:
+                    winner_names = [names_by_id.get(w, w) for w in winners]
+                    st.success(f"🏆 Ganhador(es): {', '.join(winner_names)} — Prêmio: **R$ {prize_per:.2f}** cada")
+                else:
+                    st.warning("Sem ganhadores de placar exato para esta partida.")
             else:
-                st.write("Sem ganhadores exatos para esta partida.")
+                st.caption("🔵 Partida em aberto — aguardando encerramento.")
             st.divider()
 
     conn.close()
