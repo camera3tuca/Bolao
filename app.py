@@ -28,7 +28,8 @@ def format_brt(dt):
 
 # set_page_config PRECISA ser o primeiro comando Streamlit do script (antes
 # de qualquer acesso a st.secrets abaixo).
-st.set_page_config(page_title="Bolão de Futebol", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Bolão de Futebol", page_icon="⚽",
+                   layout="wide", initial_sidebar_state="collapsed")
 
 
 # ---------------------------------------------------------
@@ -521,13 +522,14 @@ def calculate_prize_split(match_id):
         if not match or not match["completed"]:
             return 0, 0, []
 
-        bet_amount = match["bet_amount"]
+        bet_amount = match["bet_amount"] or 0.0
         c.execute('SELECT * FROM predictions WHERE match_id = %s', (match_id,))
         match_predictions = c.fetchall()
 
-        total_pot = len(match_predictions) * bet_amount
-        if total_pot == 0:
-            return 0, 0, []
+        # O pote é formado apenas pelos pagamentos CONFIRMADOS (dinheiro que
+        # realmente entrou), não pelo número total de participantes.
+        paid_count = sum(1 for p in match_predictions if p["paid"])
+        total_pot = paid_count * bet_amount
 
         winners = [
             pred["user_id"]
@@ -538,7 +540,7 @@ def calculate_prize_split(match_id):
     finally:
         conn.close()
 
-    if not winners:
+    if total_pot == 0 or not winners:
         return total_pot, 0, []
 
     prize_per_winner = total_pot / len(winners)
@@ -615,6 +617,31 @@ def _render_connection_error():
 # ---------------------------------------------------------
 # Interface Streamlit
 # ---------------------------------------------------------
+def _inject_css():
+    """Ajustes de cor/estilo (cards de indicadores, cabeçalho, botões)."""
+    st.markdown(
+        """
+        <style>
+          .block-container { padding-top: 2rem; max-width: 1050px; }
+          h1 { color:#14532d; font-weight:800; letter-spacing:-.5px; }
+          h2, h3 { color:#166534; }
+          /* Cards de indicadores (st.metric) */
+          div[data-testid="stMetric"]{
+            background:#f0fdf4; border:1px solid #bbf7d0;
+            border-left:5px solid #16a34a; padding:14px 16px;
+            border-radius:12px; box-shadow:0 1px 2px rgba(0,0,0,.04);
+          }
+          div[data-testid="stMetricValue"]{ color:#15803d; font-weight:700; }
+          div[data-testid="stMetricLabel"] p{ color:#374151; font-weight:600; }
+          /* Expander do admin com destaque */
+          details[open] > summary { color:#166534; }
+          hr { margin:.8rem 0; border-color:#dcfce7; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _match_label(match):
     label = f"{match['team_a']} x {match['team_b']}"
     if match.get("completed"):
@@ -622,12 +649,81 @@ def _match_label(match):
     return label
 
 
-def render_dashboard():
-    st.title("⚽ Bolão de Futebol - Dashboard")
+def _render_admin_panel(matches_dict, detailed):
+    """Conteúdo do painel de administração (dentro de um expander)."""
+    st.markdown("**➕ Criar / Atualizar Partida**")
+    ca, cb, cc = st.columns([2, 2, 1])
+    team_a_input = ca.text_input("Time A", "Brasil", key="adm_ta")
+    team_b_input = cb.text_input("Time B", "Noruega", key="adm_tb")
+    bet_val = cc.number_input("Aposta (R$)", min_value=0.0, value=10.0, step=1.0, key="adm_bet")
+    if st.button("💾 Salvar Partida", key="adm_save"):
+        create_match(team_a_input, team_b_input, bet_amount=bet_val)
+        st.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val:.2f})")
+        st.rerun()
 
-    st.sidebar.header("Administração")
-    admin_pw = st.sidebar.text_input("Senha de Administrador", type="password")
-    is_admin = admin_pw == ADMIN_PASSWORD
+    st.divider()
+    st.markdown("**🏁 Finalizar Partida**")
+    if matches_dict:
+        m2f = st.selectbox("Partida para encerrar", list(matches_dict.keys()),
+                           format_func=lambda mid: _match_label(matches_dict[mid]), key="adm_fin")
+        if m2f:
+            fa, fb = st.columns(2)
+            sa = fa.number_input(f"Gols {matches_dict[m2f]['team_a']}", min_value=0, step=1, key="adm_sa")
+            sb = fb.number_input(f"Gols {matches_dict[m2f]['team_b']}", min_value=0, step=1, key="adm_sb")
+            if st.button("✅ Encerrar e Calcular", key="adm_finbtn"):
+                update_match_result(m2f, sa, sb)
+                st.success("Partida encerrada!")
+                st.rerun()
+    else:
+        st.caption("Nenhuma partida cadastrada ainda.")
+
+    st.divider()
+    st.markdown("**💸 Confirmar Pagamento**")
+    if detailed:
+        pay_opts = {f"{d['user_id']}_{d['match_id']}": d for d in detailed}
+        pk = st.selectbox("Palpite", list(pay_opts.keys()),
+                          format_func=lambda k: f"{'✅' if pay_opts[k]['paid'] else '⏳'} {pay_opts[k]['name']} · {pay_opts[k]['team_a']}x{pay_opts[k]['team_b']}",
+                          key="adm_pay")
+        if pk:
+            d = pay_opts[pk]
+            if d["paid"]:
+                if st.button("Marcar como PENDENTE ⏳", key="adm_payoff"):
+                    update_payment(d["user_id"], d["match_id"], False)
+                    st.rerun()
+            else:
+                if st.button("Marcar como PAGO ✅", key="adm_payon"):
+                    update_payment(d["user_id"], d["match_id"], True)
+                    st.rerun()
+    else:
+        st.caption("Nenhum palpite registrado ainda.")
+
+    st.divider()
+    st.markdown("**🗑️ Excluir**")
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        if matches_dict:
+            m2d = st.selectbox("Partida", list(matches_dict.keys()),
+                               format_func=lambda mid: _match_label(matches_dict[mid]), key="adm_delm")
+            if m2d and st.button("Deletar Partida", type="primary", key="adm_delmbtn"):
+                delete_match(m2d)
+                st.success("Partida deletada!")
+                st.rerun()
+    with dc2:
+        if detailed:
+            del_opts = {f"{d['user_id']}_{d['match_id']}": d for d in detailed}
+            kd = st.selectbox("Palpite", list(del_opts.keys()),
+                              format_func=lambda k: f"{del_opts[k]['name']} · {del_opts[k]['team_a']}x{del_opts[k]['team_b']}",
+                              key="adm_delp")
+            if kd and st.button("Deletar Palpite", type="primary", key="adm_delpbtn"):
+                d = del_opts[kd]
+                delete_prediction(d["user_id"], d["match_id"])
+                st.success("Palpite deletado!")
+                st.rerun()
+
+
+def render_dashboard():
+    _inject_css()
+    st.title("⚽ Bolão de Futebol - Dashboard")
 
     if not DB_URL:
         st.error("⚠️ **Erro de Configuração:** o aplicativo não encontrou a URL do banco de dados.")
@@ -646,85 +742,10 @@ def render_dashboard():
         st.stop()
 
     c = conn.cursor(cursor_factory=DictCursor)
-
-    # Partidas (abertas primeiro) e palpites detalhados.
     c.execute('SELECT * FROM matches ORDER BY completed, team_a')
     matches_dict = {m["match_id"]: dict(m) for m in c.fetchall()}
     active_matches = {mid: m for mid, m in matches_dict.items() if not m["completed"]}
     detailed = get_predictions_detailed()
-
-    # -----------------------------------------------------
-    # Painel de administração (barra lateral)
-    # -----------------------------------------------------
-    if is_admin:
-        st.sidebar.success("✅ Painel de administração liberado.")
-
-        st.sidebar.subheader("Criar/Atualizar Partida")
-        team_a_input = st.sidebar.text_input("Time A", "Brasil")
-        team_b_input = st.sidebar.text_input("Time B", "Noruega")
-        bet_val = st.sidebar.number_input("Valor da Aposta (R$)", min_value=0.0, value=10.0, step=1.0)
-        if st.sidebar.button("Salvar Partida"):
-            create_match(team_a_input, team_b_input, bet_amount=bet_val)
-            st.sidebar.success(f"Partida {team_a_input} x {team_b_input} salva! (Aposta: R$ {bet_val:.2f})")
-            st.rerun()
-
-        st.sidebar.subheader("Finalizar Partida")
-        if matches_dict:
-            match_to_finish = st.sidebar.selectbox(
-                "Selecione a partida para encerrar", options=list(matches_dict.keys()),
-                format_func=lambda mid: _match_label(matches_dict[mid]))
-            if match_to_finish:
-                score_a = st.sidebar.number_input(f"Gols {matches_dict[match_to_finish]['team_a']}", min_value=0, step=1)
-                score_b = st.sidebar.number_input(f"Gols {matches_dict[match_to_finish]['team_b']}", min_value=0, step=1)
-                if st.sidebar.button("Encerrar Partida e Calcular"):
-                    update_match_result(match_to_finish, score_a, score_b)
-                    st.sidebar.success("Partida encerrada!")
-                    st.rerun()
-
-        st.sidebar.subheader("Confirmar Pagamento")
-        if detailed:
-            pay_options = {f"{d['user_id']}_{d['match_id']}": d for d in detailed}
-            pay_key = st.sidebar.selectbox(
-                "Selecione o palpite", options=list(pay_options.keys()),
-                format_func=lambda k: f"{'✅' if pay_options[k]['paid'] else '⏳'} {pay_options[k]['name']} · {pay_options[k]['team_a']}x{pay_options[k]['team_b']}",
-                key="pay_select")
-            if pay_key:
-                d = pay_options[pay_key]
-                if d["paid"]:
-                    if st.sidebar.button("Marcar como PENDENTE ⏳", key="pay_off"):
-                        update_payment(d["user_id"], d["match_id"], False)
-                        st.rerun()
-                else:
-                    if st.sidebar.button("Marcar como PAGO ✅", key="pay_on"):
-                        update_payment(d["user_id"], d["match_id"], True)
-                        st.rerun()
-        else:
-            st.sidebar.caption("Nenhum palpite registrado ainda.")
-
-        st.sidebar.subheader("Deletar Partida")
-        if matches_dict:
-            match_to_delete = st.sidebar.selectbox(
-                "Selecione a partida para deletar", options=list(matches_dict.keys()),
-                format_func=lambda mid: _match_label(matches_dict[mid]), key="del_match_select")
-            if match_to_delete and st.sidebar.button("Deletar Partida", type="primary"):
-                delete_match(match_to_delete)
-                st.sidebar.success("Partida e palpites associados deletados!")
-                st.rerun()
-
-        st.sidebar.subheader("Deletar Palpite")
-        if detailed:
-            del_options = {f"{d['user_id']}_{d['match_id']}": d for d in detailed}
-            del_key = st.sidebar.selectbox(
-                "Selecione o palpite para deletar", options=list(del_options.keys()),
-                format_func=lambda k: f"{del_options[k]['name']} · {del_options[k]['team_a']}x{del_options[k]['team_b']}",
-                key="del_pred_select")
-            if del_key and st.sidebar.button("Deletar Palpite", type="primary", key="del_pred_btn"):
-                d = del_options[del_key]
-                delete_prediction(d["user_id"], d["match_id"])
-                st.sidebar.success("Palpite deletado!")
-                st.rerun()
-    else:
-        st.sidebar.info("Área restrita. Insira a senha para liberar o painel.")
 
     # -----------------------------------------------------
     # Indicadores (KPIs) no topo
@@ -738,138 +759,160 @@ def render_dashboard():
     k3.metric("📝 Palpites", total_palpites)
     k4.metric("💸 Pagamentos", f"{total_pagos}/{total_palpites}" if total_palpites else "0/0")
 
-    tab_reg, tab_rank, tab_preds, tab_prizes = st.tabs(
-        ["📝 Registrar Palpite", "🏆 Ranking", "📊 Palpites", "💰 Prêmios (Pix)"])
+    # -----------------------------------------------------
+    # Administração: checkbox -> senha -> expander
+    # -----------------------------------------------------
+    if st.checkbox("🔐 Sou administrador"):
+        admin_pw = st.text_input("Senha de Administrador", type="password", key="admin_pw")
+        if admin_pw == ADMIN_PASSWORD:
+            with st.expander("⚙️ Painel de Administração", expanded=True):
+                _render_admin_panel(matches_dict, detailed)
+        elif admin_pw:
+            st.error("Senha incorreta.")
 
-    # ---------------- Aba: Registrar Palpite ----------------
-    with tab_reg:
-        st.subheader("📝 Registrar Palpite")
-        if not active_matches:
-            st.info("Não há partidas abertas para receber palpites no momento.")
-        else:
-            with st.form("prediction_form"):
-                st.write("Insira seus dados para participar do bolão:")
-                fc1, fc2 = st.columns(2)
-                user_name = fc1.text_input("Seu Nome")
-                user_phone = fc2.text_input("Seu WhatsApp (com DDD, ex: 11999999999)")
+    st.divider()
 
-                selected_match_id = st.selectbox(
-                    "Selecione a Partida", options=list(active_matches.keys()),
-                    format_func=lambda mid: f"{active_matches[mid]['team_a']} x {active_matches[mid]['team_b']}")
+    # -----------------------------------------------------
+    # Registrar Palpite
+    # -----------------------------------------------------
+    st.subheader("📝 Registrar Palpite")
+    if not active_matches:
+        st.info("Não há partidas abertas para receber palpites no momento.")
+    else:
+        with st.form("prediction_form"):
+            st.write("Insira seus dados para participar do bolão:")
+            fc1, fc2 = st.columns(2)
+            user_name = fc1.text_input("Seu Nome")
+            user_phone = fc2.text_input("Seu WhatsApp (com DDD, ex: 11999999999)")
 
-                team_a_pred = active_matches[selected_match_id]['team_a'] if selected_match_id else ""
-                team_b_pred = active_matches[selected_match_id]['team_b'] if selected_match_id else ""
-                bet_amount = active_matches[selected_match_id]['bet_amount'] if selected_match_id else 0.0
-                if bet_amount:
-                    st.caption(f"💰 Valor da aposta desta partida: **R$ {bet_amount:.2f}**")
+            selected_match_id = st.selectbox(
+                "Selecione a Partida", options=list(active_matches.keys()),
+                format_func=lambda mid: f"{active_matches[mid]['team_a']} x {active_matches[mid]['team_b']}")
 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.write(f"**{team_a_pred}**")
-                    score_a_pred = st.number_input("Gols Time A", min_value=0, step=1)
-                with col2:
-                    st.write(f"**{team_b_pred}**")
-                    score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
+            team_a_pred = active_matches[selected_match_id]['team_a'] if selected_match_id else ""
+            team_b_pred = active_matches[selected_match_id]['team_b'] if selected_match_id else ""
+            bet_amount = active_matches[selected_match_id]['bet_amount'] if selected_match_id else 0.0
+            if bet_amount:
+                st.caption(f"💰 Valor da aposta desta partida: **R$ {bet_amount:.2f}**")
 
-                paid_checkbox = st.checkbox("Já realizei o pagamento da aposta (Pix)")
-                submit_btn = st.form_submit_button("Enviar Palpite", type="primary")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**{team_a_pred}**")
+                score_a_pred = st.number_input("Gols Time A", min_value=0, step=1)
+            with col2:
+                st.write(f"**{team_b_pred}**")
+                score_b_pred = st.number_input("Gols Time B", min_value=0, step=1)
 
-                if submit_btn:
-                    phone_digits = re.sub(r'\D', '', user_phone)
-                    if not user_name:
-                        st.error("Por favor, preencha o seu nome!")
-                    elif not re.match(r'^\d{10,11}$', phone_digits):
-                        st.error("Por favor, informe um número de WhatsApp válido (com DDD, somente números).")
-                    elif not selected_match_id:
-                        st.error("Nenhuma partida selecionada!")
-                    else:
-                        fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
-                        success, msg = parse_prediction(fake_msg, phone=user_phone, paid=paid_checkbox)
-                        if success:
-                            registrado = format_brt(datetime.now(timezone.utc))
-                            pgto = "✅ pagamento confirmado" if paid_checkbox else "⏳ pagamento pendente"
-                            st.success(f"{msg}\n\n🕒 Registrado em {registrado} · {pgto}. "
-                                       f"Entraremos em contato via {user_phone} se você ganhar!")
-                            st.rerun()
-                        else:
-                            st.error(msg)
+            paid_checkbox = st.checkbox("Já realizei o pagamento da aposta (Pix)")
+            submit_btn = st.form_submit_button("Enviar Palpite", type="primary")
 
-    # ---------------- Aba: Ranking ----------------
-    with tab_rank:
-        st.subheader("🏆 Ranking Geral")
-        ranking = generate_ranking()
-        if ranking:
-            df_rank = pd.DataFrame(ranking).rename(columns={"name": "Nome", "score": "Pontos"})
-            df_rank.index = range(1, len(df_rank) + 1)
-            df_rank.index.name = "Posição"
-            st.dataframe(df_rank, use_container_width=True)
-            st.caption("Pontuação: **3** pontos por placar exato · **1** por acertar o vencedor/empate.")
-        else:
-            st.info("Nenhum usuário no ranking ainda.")
-
-    # ---------------- Aba: Palpites ----------------
-    with tab_preds:
-        st.subheader("📊 Palpites Registrados")
-        if detailed:
-            filtro = st.radio("Filtrar por pagamento", ["Todos", "✅ Pagos", "⏳ Pendentes"],
-                              horizontal=True)
-            rows = []
-            for d in detailed:
-                if filtro == "✅ Pagos" and not d["paid"]:
-                    continue
-                if filtro == "⏳ Pendentes" and d["paid"]:
-                    continue
-                rows.append({
-                    "Registrado em": format_brt(d["created_at"]),
-                    "Nome": d["name"],
-                    "Partida": f"{d['team_a']} x {d['team_b']}",
-                    "Palpite": f"{d['score_a']} x {d['score_b']}",
-                    "Pagamento": "✅ Pago" if d["paid"] else "⏳ Pendente",
-                })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            else:
-                st.info("Nenhum palpite para este filtro.")
-        else:
-            st.info("Nenhum palpite registrado.")
-
-    # ---------------- Aba: Prêmios (Pix) ----------------
-    with tab_prizes:
-        st.subheader("💰 Status dos Prêmios (Pix)")
-        names_by_id = {d["user_id"]: d["name"] for d in detailed}
-        matches_with_preds = [mid for mid in matches_dict if any(d["match_id"] == mid for d in detailed)]
-
-        if not matches_with_preds:
-            st.info("Nenhuma partida com palpites ainda.")
-        for mid in matches_with_preds:
-            match = matches_dict[mid]
-            preds = [d for d in detailed if d["match_id"] == mid]
-            n = len(preds)
-            pagos = sum(1 for d in preds if d["paid"])
-            bet = match["bet_amount"] or 0.0
-            esperado = n * bet
-            confirmado = pagos * bet
-
-            st.markdown(f"### {match['team_a']} x {match['team_b']}")
-            pc1, pc2, pc3, pc4 = st.columns(4)
-            pc1.metric("Participantes", n)
-            pc2.metric("Pote esperado", f"R$ {esperado:.2f}")
-            pc3.metric("Confirmado (pago)", f"R$ {confirmado:.2f}")
-            pc4.metric("Pendente", f"R$ {esperado - confirmado:.2f}",
-                       delta=(f"{n - pagos} sem pagar" if n - pagos else "tudo pago"),
-                       delta_color="inverse")
-
-            if match["completed"]:
-                tot_pot, prize_per, winners = calculate_prize_split(mid)
-                st.markdown(f"**Resultado: {match['team_a']} {match['score_a']} x {match['score_b']} {match['team_b']}**")
-                if winners:
-                    winner_names = [names_by_id.get(w, w) for w in winners]
-                    st.success(f"🏆 Ganhador(es): {', '.join(winner_names)} — Prêmio: **R$ {prize_per:.2f}** cada")
+            if submit_btn:
+                phone_digits = re.sub(r'\D', '', user_phone)
+                if not user_name:
+                    st.error("Por favor, preencha o seu nome!")
+                elif not re.match(r'^\d{10,11}$', phone_digits):
+                    st.error("Por favor, informe um número de WhatsApp válido (com DDD, somente números).")
+                elif not selected_match_id:
+                    st.error("Nenhuma partida selecionada!")
                 else:
-                    st.warning("Sem ganhadores de placar exato para esta partida.")
+                    fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
+                    success, msg = parse_prediction(fake_msg, phone=user_phone, paid=paid_checkbox)
+                    if success:
+                        registrado = format_brt(datetime.now(timezone.utc))
+                        pgto = "✅ pagamento confirmado" if paid_checkbox else "⏳ pagamento pendente"
+                        st.success(f"{msg}\n\n🕒 Registrado em {registrado} · {pgto}. "
+                                   f"Entraremos em contato via {user_phone} se você ganhar!")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Palpites (logo abaixo da entrada de dados)
+    # -----------------------------------------------------
+    st.subheader("📊 Palpites Registrados")
+    if detailed:
+        filtro = st.radio("Filtrar por pagamento", ["Todos", "✅ Pagos", "⏳ Pendentes"], horizontal=True)
+        rows = []
+        for d in detailed:
+            if filtro == "✅ Pagos" and not d["paid"]:
+                continue
+            if filtro == "⏳ Pendentes" and d["paid"]:
+                continue
+            rows.append({
+                "Registrado em": format_brt(d["created_at"]),
+                "Nome": d["name"],
+                "Partida": f"{d['team_a']} x {d['team_b']}",
+                "Palpite": f"{d['score_a']} x {d['score_b']}",
+                "Pagamento": "✅ Pago" if d["paid"] else "⏳ Pendente",
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Nenhum palpite para este filtro.")
+    else:
+        st.info("Nenhum palpite registrado.")
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Ranking
+    # -----------------------------------------------------
+    st.subheader("🏆 Ranking Geral")
+    ranking = generate_ranking()
+    if ranking:
+        df_rank = pd.DataFrame(ranking).rename(columns={"name": "Nome", "score": "Pontos"})
+        df_rank.index = range(1, len(df_rank) + 1)
+        df_rank.index.name = "Posição"
+        st.dataframe(df_rank, use_container_width=True)
+        st.caption("Pontuação: **3** pontos por placar exato · **1** por acertar o vencedor/empate.")
+    else:
+        st.info("Nenhum usuário no ranking ainda.")
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # Prêmios (Pix)
+    # -----------------------------------------------------
+    st.subheader("💰 Status dos Prêmios (Pix)")
+    names_by_id = {d["user_id"]: d["name"] for d in detailed}
+    matches_with_preds = [mid for mid in matches_dict if any(d["match_id"] == mid for d in detailed)]
+
+    if not matches_with_preds:
+        st.info("Nenhuma partida com palpites ainda.")
+    for mid in matches_with_preds:
+        match = matches_dict[mid]
+        preds = [d for d in detailed if d["match_id"] == mid]
+        n = len(preds)
+        pagos = sum(1 for d in preds if d["paid"])
+        bet = match["bet_amount"] or 0.0
+        esperado = n * bet
+        confirmado = pagos * bet
+
+        st.markdown(f"### {match['team_a']} x {match['team_b']}")
+        if not bet:
+            st.caption("⚠️ Esta partida está sem valor de aposta. Defina em **Administração → Criar/Atualizar Partida**.")
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pc1.metric("Participantes", n)
+        pc2.metric("Pote esperado", f"R$ {esperado:.2f}")
+        pc3.metric("Confirmado (pago)", f"R$ {confirmado:.2f}")
+        pc4.metric("Pendente", f"R$ {esperado - confirmado:.2f}",
+                   delta=(f"{n - pagos} sem pagar" if n - pagos else "tudo pago"),
+                   delta_color="inverse")
+
+        if match["completed"]:
+            tot_pot, prize_per, winners = calculate_prize_split(mid)
+            st.markdown(f"**Resultado: {match['team_a']} {match['score_a']} x {match['score_b']} {match['team_b']}**")
+            st.caption(f"Prêmio calculado sobre os **pagamentos confirmados**: R$ {tot_pot:.2f}.")
+            if winners:
+                winner_names = [names_by_id.get(w, w) for w in winners]
+                st.success(f"🏆 Ganhador(es): {', '.join(winner_names)} — Prêmio: **R$ {prize_per:.2f}** cada")
             else:
-                st.caption("🔵 Partida em aberto — aguardando encerramento.")
-            st.divider()
+                st.warning("Sem ganhadores de placar exato para esta partida.")
+        else:
+            st.caption("🔵 Partida em aberto — aguardando encerramento.")
+        st.divider()
 
     conn.close()
 
