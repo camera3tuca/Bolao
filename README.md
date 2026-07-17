@@ -49,12 +49,41 @@ defina a região com:
 SUPABASE_REGION = "sua-regiao"   # ex.: sa-east-1
 ```
 
+### Alternativa: Neon (também IPv4, funciona direto)
+
+O app funciona com **qualquer PostgreSQL**, incluindo o [Neon](https://neon.tech).
+O Neon é uma boa opção para o Streamlit Cloud porque o endpoint **com pooler**
+já responde por **IPv4** e a string de conexão já inclui `sslmode=require` — ou
+seja, **basta colar a string, sem conversão de pooler nem região**.
+
+No painel do Neon: **Connection Details** → ative **Connection pooling** → copie
+a *Connection string* (host termina em `-pooler.<regiao>.aws.neon.tech`) e cole
+nos Secrets:
+
+```toml
+DATABASE_URL = "postgresql://neondb_owner:[YOUR-PASSWORD]@ep-xxxx-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+```
+
+Observação: no plano free o Neon **suspende o compute** após inatividade; a
+primeira conexão pode levar alguns segundos (o app já faz uma retentativa
+automática para esse *cold start*).
+
+### Diagnóstico
+
+Se ainda houver erro de conexão, o app agora mostra a **causa provável**
+(senha incorreta, região/tenant errado ou rede/IPv4) e um expander
+**"Diagnóstico de conexão"** listando cada tentativa (host/porta/usuário, **com
+a senha sempre ocultada**). Isso torna trivial identificar o que corrigir.
+
 ## Variáveis suportadas
 
-| Chave (secrets/env)                | Descrição                                              |
-| ---------------------------------- | ------------------------------------------------------ |
-| `DATABASE_URL` / `SUPABASE_DB_URL` | String de conexão do PostgreSQL (use a URL do pooler). |
-| `SUPABASE_REGION`                  | Região usada ao converter uma URL direta em pooler.    |
+| Chave (secrets/env)                | Descrição                                               |
+| ---------------------------------- | ------------------------------------------------------- |
+| `DATABASE_URL` / `SUPABASE_DB_URL` | String de conexão do PostgreSQL (use a URL do pooler).  |
+| `SUPABASE_REGION`                  | Região usada ao converter uma URL direta em pooler.     |
+| `ADMIN_PASSWORD`                   | Senha do painel de administração (padrão `5075`).       |
+
+O `sslmode=require` é adicionado automaticamente à conexão (o Supabase exige SSL).
 
 ## Testes
 
