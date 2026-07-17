@@ -59,12 +59,29 @@ _NETWORK_SIGNALS = (
 )
 _TENANT_SIGNAL = "Tenant or user not found"
 _PASSWORD_SIGNAL = "password authentication failed"
+# Sinais transitórios (ex.: cold start do Neon no plano free) -> vale retentar.
+_TRANSIENT_SIGNALS = (
+    "timeout expired", "Connection timed out", "Connection reset",
+    "server closed the connection", "could not receive data",
+    "the database system is starting up", "Connection refused",
+)
 
-_CONNECT_TIMEOUT = 8
+_CONNECT_TIMEOUT = 10
+_MAX_ATTEMPTS_PER_URL = 2  # cold start do Neon pode falhar na 1ª tentativa
 
 # Estado de diagnóstico e cache da última URL que funcionou.
 _DIAG = {"attempts": [], "kind": None}
 _WORKING = {"url": None}
+
+
+def _provider():
+    """Identifica o provedor do banco pela URL, para mensagens específicas."""
+    url = (DB_URL or "").lower()
+    if "neon.tech" in url:
+        return "neon"
+    if "supabase" in url or "pooler.supabase.com" in url:
+        return "supabase"
+    return "generic"
 
 
 def _extract_ref(url):
@@ -150,6 +167,24 @@ def _first_line(exc):
     return text.splitlines()[0][:200] if text else repr(exc)
 
 
+def _connect(url):
+    """Conecta com pequena retentativa para erros transitórios (ex.: cold
+    start do Neon no plano free). Levanta a última exceção se falhar."""
+    import time
+    last = None
+    for attempt in range(_MAX_ATTEMPTS_PER_URL):
+        try:
+            return psycopg2.connect(url, connect_timeout=_CONNECT_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if attempt + 1 < _MAX_ATTEMPTS_PER_URL and \
+               any(sig in _first_line(exc) for sig in _TRANSIENT_SIGNALS):
+                time.sleep(2)
+                continue
+            raise
+    raise last
+
+
 def get_db_connection():
     if not DB_URL:
         return None
@@ -163,7 +198,7 @@ def get_db_connection():
 
     for url in candidates:
         try:
-            conn = psycopg2.connect(url, connect_timeout=_CONNECT_TIMEOUT)
+            conn = _connect(url)
             _WORKING["url"] = url
             _DIAG.update(attempts=attempts, kind=None)
             return conn
@@ -470,16 +505,25 @@ def _render_connection_error():
     """Mostra a mensagem correta conforme a causa classificada + diagnóstico."""
     kind = _DIAG.get("kind")
 
+    provider = _provider()
+
     if kind == "network":
-        st.error("⚠️ **Erro de Conexão com o Supabase:** O aplicativo não conseguiu se conectar ao banco de dados (rede/IPv4).")
-        st.warning("O Supabase desativou o IPv4 direto. Como o Streamlit Cloud normalmente só tem IPv4, use o **Connection Pooler** do Supabase na sua `DATABASE_URL`, em vez da URL direta.")
-        st.info("Para corrigir:\n\n"
-                "1. Supabase → **Project Settings** → **Database** → **Connection pooling**.\n"
-                "2. Copie a string do **Session pooler** (host `aws-0-<regiao>.pooler.supabase.com`, porta `5432`).\n"
-                "3. Cole em **App settings → Secrets** do Streamlit como `DATABASE_URL`, trocando `[YOUR-PASSWORD]` pela senha do banco.")
+        st.error("⚠️ **Erro de Conexão:** o aplicativo não conseguiu se conectar ao banco de dados (rede/IPv4).")
+        if provider == "neon":
+            st.warning("Use o endpoint **com `-pooler`** do Neon (ele responde por IPv4) e mantenha `sslmode=require`. No plano free o Neon **suspende o compute** após inatividade, então a primeira conexão pode demorar alguns segundos — se acabou de acordar, recarregue a página.")
+            st.info("No painel do Neon: **Connection Details** → ative **Connection pooling** → copie a *Connection string* (host `...-pooler.<regiao>.aws.neon.tech`) e cole em **App settings → Secrets** do Streamlit como `DATABASE_URL`.")
+        else:
+            st.warning("O Supabase desativou o IPv4 direto. Como o Streamlit Cloud normalmente só tem IPv4, use o **Connection Pooler** na sua `DATABASE_URL`, em vez da URL direta.")
+            st.info("Para corrigir:\n\n"
+                    "1. Supabase → **Project Settings** → **Database** → **Connection pooling**.\n"
+                    "2. Copie a string do **Session pooler** (host `aws-0-<regiao>.pooler.supabase.com`, porta `5432`).\n"
+                    "3. Cole em **App settings → Secrets** do Streamlit como `DATABASE_URL`, trocando `[YOUR-PASSWORD]` pela senha do banco.")
     elif kind == "password":
         st.error("⚠️ **Falha de autenticação:** a senha do banco na `DATABASE_URL` está incorreta.")
-        st.info("Confira/redefina a senha em Supabase → **Project Settings → Database** (botão *Reset password*) e atualize o `DATABASE_URL` nos Secrets do Streamlit. Cuidado com caracteres especiais na senha (eles precisam ser URL-encoded).")
+        if provider == "neon":
+            st.info("Confira/redefina a senha no painel do Neon (**Connection Details → Reset password**) e atualize o `DATABASE_URL` nos Secrets do Streamlit. Cuidado com caracteres especiais na senha (precisam ser URL-encoded).")
+        else:
+            st.info("Confira/redefina a senha em Supabase → **Project Settings → Database** (botão *Reset password*) e atualize o `DATABASE_URL` nos Secrets do Streamlit. Cuidado com caracteres especiais na senha (precisam ser URL-encoded).")
     elif kind == "tenant":
         st.error("⚠️ **Projeto/usuário não reconhecido pelo pooler** ('Tenant or user not found').")
         st.info("Verifique se o usuário é `postgres.<project_ref>` e se a **região** do pooler está correta. Tentei várias regiões automaticamente sem sucesso — confirme o `project_ref` e a região em Supabase → Database → Connection pooling.")
@@ -505,7 +549,7 @@ def render_dashboard():
 
     if not DB_URL:
         st.error("⚠️ **Erro de Configuração:** o aplicativo não encontrou a URL do banco de dados.")
-        st.info("Configure a `DATABASE_URL` (ou `SUPABASE_DB_URL`) nos Secrets do Streamlit ou nas variáveis de ambiente. Use a URL do **Connection Pooler** do Supabase.")
+        st.info("Configure a `DATABASE_URL` (ou `SUPABASE_DB_URL`) nos Secrets do Streamlit ou nas variáveis de ambiente. Use a string do **pooler** do seu provedor (Supabase Connection Pooler ou Neon endpoint `-pooler`).")
         st.stop()
 
     if not init_db():
