@@ -554,32 +554,70 @@ def calculate_prize_split(match_id):
     return total_pot, prize_per_winner, winners
 
 
-def generate_ranking():
+def generate_ranking(competition=None, manual_only=False):
+    """Ranking dos participantes.
+
+    - competition=None (padrão): considera todas as partidas.
+    - competition="Nome": apenas as partidas daquele campeonato.
+    - manual_only=True: apenas partidas avulsas (sem campeonato).
+
+    Inclui quem palpitou no escopo (mesmo com 0 pontos); a pontuação vem
+    das partidas já encerradas."""
     conn = get_db_connection()
     if not conn:
         return []
+    where, params = "", []
+    if manual_only:
+        where = "WHERE m.competition IS NULL"
+    elif competition is not None:
+        where = "WHERE m.competition = %s"
+        params.append(competition)
     try:
         c = conn.cursor(cursor_factory=DictCursor)
-
-        c.execute('SELECT user_id, name, score FROM users')
-        all_users = {row["user_id"]: dict(row) for row in c.fetchall()}
-        for u in all_users.values():
-            u["score"] = 0  # Recalcula do zero em memória
-
-        c.execute('SELECT * FROM matches WHERE completed = TRUE')
-        completed_matches = c.fetchall()
-        for match in completed_matches:
-            c.execute('SELECT * FROM predictions WHERE match_id = %s', (match["match_id"],))
-            for pred in c.fetchall():
-                points = calculate_score(pred["score_a"], pred["score_b"],
-                                         match["score_a"], match["score_b"])
-                if points > 0 and pred["user_id"] in all_users:
-                    all_users[pred["user_id"]]["score"] += points
+        c.execute(f'''
+            SELECT p.user_id, u.name, p.score_a AS ps_a, p.score_b AS ps_b,
+                   m.completed, m.score_a AS ms_a, m.score_b AS ms_b
+            FROM predictions p
+            JOIN users u ON p.user_id = u.user_id
+            JOIN matches m ON p.match_id = m.match_id
+            {where}
+        ''', params)
+        rows = c.fetchall()
     finally:
         conn.close()
 
-    ranking = sorted(all_users.values(), key=lambda x: x["score"], reverse=True)
+    agg = {}
+    for r in rows:
+        entry = agg.setdefault(r["user_id"], {"name": r["name"], "score": 0})
+        if r["completed"] and r["ms_a"] is not None and r["ms_b"] is not None:
+            entry["score"] += calculate_score(r["ps_a"], r["ps_b"], r["ms_a"], r["ms_b"])
+
+    ranking = sorted(agg.values(), key=lambda x: (-x["score"], x["name"]))
     return [{"name": u["name"], "score": u["score"]} for u in ranking]
+
+
+def delete_competition(competition, season=None):
+    """Apaga um campeonato inteiro: todas as partidas e seus palpites — o
+    que também zera o ranking daquele campeonato. Retorna quantas partidas
+    foram removidas."""
+    conn = get_db_connection()
+    if not conn:
+        return 0
+    try:
+        c = conn.cursor()
+        if season is not None:
+            c.execute('SELECT match_id FROM matches WHERE competition = %s AND season = %s',
+                      (competition, season))
+        else:
+            c.execute('SELECT match_id FROM matches WHERE competition = %s', (competition,))
+        ids = [r[0] for r in c.fetchall()]
+        if ids:
+            c.execute('DELETE FROM predictions WHERE match_id = ANY(%s)', (ids,))
+            c.execute('DELETE FROM matches WHERE match_id = ANY(%s)', (ids,))
+            conn.commit()
+        return len(ids)
+    finally:
+        conn.close()
 
 
 def register_prediction(match_id, name, phone, score_a, score_b, paid):
@@ -893,6 +931,19 @@ def _render_admin_panel(matches_dict, detailed):
                 st.success("Palpite deletado!")
                 st.rerun()
 
+    imported = get_imported_competitions()
+    if imported:
+        st.markdown("**🏆 Deletar campeonato inteiro** (apaga partidas, palpites e o ranking dele)")
+        comp_opts = {f"{comp}|{season}": (comp, season) for comp, season in imported}
+        ck = st.selectbox("Campeonato", list(comp_opts.keys()),
+                          format_func=lambda k: f"{comp_opts[k][0]} — {comp_opts[k][1]}",
+                          key="adm_delcomp")
+        if ck and st.button("🗑️ Deletar Campeonato", type="primary", key="adm_delcompbtn"):
+            comp, season = comp_opts[ck]
+            n = delete_competition(comp, season)
+            st.success(f"Campeonato {comp} {season} removido ({n} partidas). Ranking zerado.")
+            st.rerun()
+
     st.divider()
     st.markdown("**🌐 Importar campeonato (API-Football)**")
     if not api_football_key():
@@ -903,7 +954,9 @@ def _render_admin_panel(matches_dict, detailed):
         ic1, ic2 = st.columns([2, 1])
         comp = ic1.selectbox("Campeonato", list(COMPETITIONS.keys()), key="imp_comp")
         season = ic2.number_input("Temporada", min_value=2015, max_value=2100,
-                                  value=datetime.now(BRT).year, step=1, key="imp_season")
+                                  value=2024, step=1, key="imp_season")
+        st.caption("ℹ️ O plano **free** da API-Football libera temporadas de **2022 a 2024**. "
+                   "Para 2025/2026 é preciso um plano pago.")
         ib1, ib2 = st.columns(2)
         if ib1.button("⬇️ Importar / Atualizar rodadas", key="imp_btn"):
             with st.spinner("Buscando rodadas na API..."):
@@ -1108,18 +1161,40 @@ def render_dashboard():
     st.divider()
 
     # -----------------------------------------------------
-    # Ranking
+    # Ranking (separado por campeonato)
     # -----------------------------------------------------
-    st.subheader("🏆 Ranking Geral")
-    ranking = generate_ranking()
-    if ranking:
-        df_rank = pd.DataFrame(ranking).rename(columns={"name": "Nome", "score": "Pontos"})
-        df_rank.index = range(1, len(df_rank) + 1)
-        df_rank.index.name = "Posição"
-        st.dataframe(df_rank, use_container_width=True)
-        st.caption("Pontuação: **3** pontos por placar exato · **1** por acertar o vencedor/empate.")
+    st.subheader("🏆 Ranking")
+
+    def _show_ranking(rk):
+        if rk:
+            df_rank = pd.DataFrame(rk).rename(columns={"name": "Nome", "score": "Pontos"})
+            df_rank.index = range(1, len(df_rank) + 1)
+            df_rank.index.name = "Posição"
+            st.dataframe(df_rank, use_container_width=True)
+        else:
+            st.info("Nenhum participante ainda.")
+
+    comps_present = sorted({m["competition"] for m in matches_dict.values() if m.get("competition")})
+    has_manual = any(not m.get("competition") for m in matches_dict.values())
+
+    if sel_comp != "Todos":
+        # Filtro ativo: mostra só o ranking do campeonato selecionado.
+        _show_ranking(generate_ranking(competition=sel_comp))
+    elif comps_present:
+        # Um ranking por campeonato.
+        for comp in comps_present:
+            st.markdown(f"#### 🏆 {comp}")
+            _show_ranking(generate_ranking(competition=comp))
+        if has_manual:
+            manual_rk = generate_ranking(manual_only=True)
+            if manual_rk:
+                st.markdown("#### 🏆 Partidas avulsas")
+                _show_ranking(manual_rk)
     else:
-        st.info("Nenhum usuário no ranking ainda.")
+        # Sem campeonatos importados: ranking único das partidas avulsas.
+        _show_ranking(generate_ranking())
+
+    st.caption("Pontuação: **3** pontos por placar exato · **1** por acertar o vencedor/empate.")
 
     st.divider()
 
