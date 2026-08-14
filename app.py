@@ -310,6 +310,12 @@ def init_db():
                         bet_amount REAL DEFAULT 0.0
                     )
                 ''')
+                # Colunas para partidas importadas de uma API de campeonato.
+                c.execute('ALTER TABLE matches ADD COLUMN IF NOT EXISTS external_id TEXT;')
+                c.execute('ALTER TABLE matches ADD COLUMN IF NOT EXISTS round TEXT;')
+                c.execute('ALTER TABLE matches ADD COLUMN IF NOT EXISTS match_time TIMESTAMPTZ;')
+                c.execute('ALTER TABLE matches ADD COLUMN IF NOT EXISTS competition TEXT;')
+                c.execute('ALTER TABLE matches ADD COLUMN IF NOT EXISTS season INTEGER;')
                 c.execute('''
                     CREATE TABLE IF NOT EXISTS predictions (
                         user_id TEXT,
@@ -479,7 +485,8 @@ def get_predictions_detailed():
         c = conn.cursor(cursor_factory=DictCursor)
         c.execute('''
             SELECT p.user_id, p.match_id, p.score_a, p.score_b, p.paid, p.created_at,
-                   u.name, u.phone, m.team_a, m.team_b, m.completed, m.bet_amount
+                   u.name, u.phone, m.team_a, m.team_b, m.completed, m.bet_amount,
+                   m.round, m.competition, m.match_time
             FROM predictions p
             JOIN users u ON p.user_id = u.user_id
             JOIN matches m ON p.match_id = m.match_id
@@ -575,6 +582,170 @@ def generate_ranking():
     return [{"name": u["name"], "score": u["score"]} for u in ranking]
 
 
+def register_prediction(match_id, name, phone, score_a, score_b, paid):
+    """Registra o palpite de um usuário para uma partida JÁ existente
+    (inclusive as importadas da API), sem recriar a partida pelos nomes."""
+    if not name:
+        return False, "Por favor, preencha o seu nome!"
+    user_id = get_or_create_user(name, phone=phone)
+    conn = get_db_connection()
+    if not conn:
+        return False, "Banco de dados indisponível."
+    try:
+        c = conn.cursor(cursor_factory=DictCursor)
+        c.execute('''
+            INSERT INTO predictions (user_id, match_id, score_a, score_b, paid, created_at)
+            VALUES (%s, %s, %s, %s, %s, now())
+            ON CONFLICT(user_id, match_id) DO UPDATE SET
+                score_a=excluded.score_a, score_b=excluded.score_b,
+                paid=excluded.paid, created_at=now()
+        ''', (user_id, match_id, int(score_a), int(score_b), bool(paid)))
+        conn.commit()
+    finally:
+        conn.close()
+    return True, "Palpite registrado com sucesso."
+
+
+# ---------------------------------------------------------
+# Integração com API de campeonatos (API-Football / api-sports.io)
+#
+# Importa todas as rodadas de um campeonato (jogos, datas e resultados) e
+# mantém os placares atualizados. Requer a chave APIFOOTBALL_KEY (conta
+# gratuita em https://dashboard.api-football.com/).
+# ---------------------------------------------------------
+APIFOOTBALL_BASE = "https://v3.football.api-sports.io"
+
+# Ligas suportadas (ids da API-Football).
+COMPETITIONS = {
+    "Brasileirão Série A": 71,
+    "Brasileirão Série B": 72,
+    "Copa do Brasil": 73,
+    "Libertadores": 13,
+}
+
+# Status da API-Football que indicam jogo encerrado.
+_FINISHED_STATUSES = ("FT", "AET", "PEN")
+
+
+def api_football_key():
+    return _secret("APIFOOTBALL_KEY") or _secret("API_FOOTBALL_KEY")
+
+
+def _round_label(raw):
+    """Converte o 'round' da API em rótulo curto. 'Regular Season - 12' ->
+    'Rodada 12'; fases de mata-mata são mantidas."""
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    m = re.search(r'(\d+)\s*$', raw)
+    if "Regular Season" in raw and m:
+        return f"Rodada {int(m.group(1))}"
+    return raw
+
+
+def _round_sort_key(label):
+    """Ordena 'Rodada N' por N; outros rótulos vão para o fim, em ordem alfabética."""
+    m = re.search(r'(\d+)', label or "")
+    return (0, int(m.group(1))) if (label and "Rodada" in label and m) else (1, label or "")
+
+
+def fetch_fixtures(league_id, season):
+    """Busca todos os jogos de uma liga/temporada na API-Football."""
+    key = api_football_key()
+    if not key:
+        raise RuntimeError("Chave APIFOOTBALL_KEY não configurada.")
+    import urllib.request
+    import json as _json
+    url = f"{APIFOOTBALL_BASE}/fixtures?league={int(league_id)}&season={int(season)}"
+    req = urllib.request.Request(url, headers={"x-apisports-key": key})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return _json.load(resp)
+
+
+def import_fixtures_payload(payload, competition_name, season):
+    """Insere/atualiza no banco os jogos vindos da API. Preserva o valor da
+    aposta (bet_amount) de partidas já existentes. Retorna quantos gravou."""
+    fixtures = payload.get("response", []) if isinstance(payload, dict) else []
+    conn = get_db_connection()
+    if not conn:
+        return 0
+    count = 0
+    try:
+        c = conn.cursor()
+        for fx in fixtures:
+            try:
+                fid = fx["fixture"]["id"]
+                dt = fx["fixture"].get("date")
+                status = (fx["fixture"].get("status") or {}).get("short", "")
+                rnd = _round_label((fx.get("league") or {}).get("round"))
+                home = fx["teams"]["home"]["name"]
+                away = fx["teams"]["away"]["name"]
+                goals = fx.get("goals") or {}
+            except (KeyError, TypeError):
+                continue
+            completed = status in _FINISHED_STATUSES
+            score_a = goals.get("home") if completed else None
+            score_b = goals.get("away") if completed else None
+            match_id = f"api_{fid}"
+            c.execute('''
+                INSERT INTO matches (match_id, team_a, team_b, score_a, score_b,
+                                     completed, bet_amount, external_id, round,
+                                     match_time, competition, season)
+                VALUES (%s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s)
+                ON CONFLICT (match_id) DO UPDATE SET
+                    team_a=excluded.team_a, team_b=excluded.team_b,
+                    score_a=excluded.score_a, score_b=excluded.score_b,
+                    completed=excluded.completed, external_id=excluded.external_id,
+                    round=excluded.round, match_time=excluded.match_time,
+                    competition=excluded.competition, season=excluded.season
+            ''', (match_id, home, away, score_a, score_b, completed,
+                  str(fid), rnd, dt, competition_name, int(season)))
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return count
+
+
+def import_competition(competition_name, season):
+    """Importa/atualiza um campeonato. Retorna (qtd, erro)."""
+    league_id = COMPETITIONS.get(competition_name)
+    if not league_id:
+        return 0, "Campeonato não suportado."
+    try:
+        payload = fetch_fixtures(league_id, season)
+    except Exception as e:  # noqa: BLE001
+        return 0, str(e)
+    errs = payload.get("errors") if isinstance(payload, dict) else None
+    if errs:
+        return 0, f"API retornou erro: {errs}"
+    return import_fixtures_payload(payload, competition_name, season), None
+
+
+def get_imported_competitions():
+    """Lista (competição, temporada) já importados."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        c = conn.cursor(cursor_factory=DictCursor)
+        c.execute('''SELECT DISTINCT competition, season FROM matches
+                     WHERE external_id IS NOT NULL AND competition IS NOT NULL
+                     ORDER BY competition, season''')
+        return [(r["competition"], r["season"]) for r in c.fetchall()]
+    finally:
+        conn.close()
+
+
+def update_all_imported():
+    """Reimporta (atualiza resultados) de todos os campeonatos já importados."""
+    results = []
+    for comp, season in get_imported_competitions():
+        n, err = import_competition(comp, season)
+        results.append((comp, season, n, err))
+    return results
+
+
 # ---------------------------------------------------------
 # Mensagens de erro de conexão
 # ---------------------------------------------------------
@@ -644,7 +815,9 @@ def _inject_css():
 
 def _match_label(match):
     label = f"{match['team_a']} x {match['team_b']}"
-    if match.get("completed"):
+    if match.get("round"):
+        label = f"[{match['round']}] {label}"
+    if match.get("completed") and match.get("score_a") is not None:
         label = f"✅ {label} ({match['score_a']} x {match['score_b']})"
     return label
 
@@ -720,6 +893,43 @@ def _render_admin_panel(matches_dict, detailed):
                 st.success("Palpite deletado!")
                 st.rerun()
 
+    st.divider()
+    st.markdown("**🌐 Importar campeonato (API-Football)**")
+    if not api_football_key():
+        st.info("Para importar campeonatos automaticamente, crie uma conta grátis em "
+                "https://dashboard.api-football.com/ e adicione a chave `APIFOOTBALL_KEY` "
+                "nos **Secrets** do Streamlit.")
+    else:
+        ic1, ic2 = st.columns([2, 1])
+        comp = ic1.selectbox("Campeonato", list(COMPETITIONS.keys()), key="imp_comp")
+        season = ic2.number_input("Temporada", min_value=2015, max_value=2100,
+                                  value=datetime.now(BRT).year, step=1, key="imp_season")
+        ib1, ib2 = st.columns(2)
+        if ib1.button("⬇️ Importar / Atualizar rodadas", key="imp_btn"):
+            with st.spinner("Buscando rodadas na API..."):
+                n, err = import_competition(comp, int(season))
+            if err:
+                st.error(f"Falha ao importar: {err}")
+            else:
+                st.success(f"{n} jogos de {comp} {int(season)} importados/atualizados.")
+                st.rerun()
+        if ib2.button("🔄 Atualizar resultados agora", key="upd_btn"):
+            with st.spinner("Atualizando resultados..."):
+                res = update_all_imported()
+            if not res:
+                st.info("Nenhum campeonato importado ainda.")
+            else:
+                resumo = ", ".join(f"{c} {s}: {n}" + (" ⚠️" if e else "") for c, s, n, e in res)
+                st.success(f"Atualizado — {resumo}")
+                st.rerun()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _auto_update_results():
+    """Atualiza os resultados automaticamente ao abrir o app, no máximo uma
+    vez a cada 30 min por instância do servidor (respeita o limite da API)."""
+    return update_all_imported()
+
 
 def render_dashboard():
     _inject_css()
@@ -741,8 +951,16 @@ def render_dashboard():
         _render_connection_error()
         st.stop()
 
+    # Atualização automática dos resultados dos campeonatos importados
+    # (throttled em 30 min; roda no máximo 1x por instância do servidor).
+    if api_football_key():
+        try:
+            _auto_update_results()
+        except Exception:
+            pass
+
     c = conn.cursor(cursor_factory=DictCursor)
-    c.execute('SELECT * FROM matches ORDER BY completed, team_a')
+    c.execute('SELECT * FROM matches ORDER BY completed, match_time NULLS LAST, team_a')
     matches_dict = {m["match_id"]: dict(m) for m in c.fetchall()}
     active_matches = {mid: m for mid, m in matches_dict.items() if not m["completed"]}
     detailed = get_predictions_detailed()
@@ -773,11 +991,33 @@ def render_dashboard():
     st.divider()
 
     # -----------------------------------------------------
+    # Filtro de campeonato / rodada (quando há partidas importadas)
+    # -----------------------------------------------------
+    comps = sorted({m["competition"] for m in matches_dict.values() if m.get("competition")})
+    sel_comp, sel_round = "Todos", "Todas"
+    if comps:
+        fcol1, fcol2 = st.columns(2)
+        sel_comp = fcol1.selectbox("🏆 Campeonato", ["Todos"] + comps)
+        rounds = sorted({m["round"] for m in matches_dict.values()
+                         if m.get("round") and (sel_comp == "Todos" or m.get("competition") == sel_comp)},
+                        key=_round_sort_key)
+        sel_round = fcol2.selectbox("📅 Rodada", ["Todas"] + rounds)
+
+    def _passes(m):
+        if sel_comp != "Todos" and m.get("competition") != sel_comp:
+            return False
+        if sel_round != "Todas" and m.get("round") != sel_round:
+            return False
+        return True
+
+    active_filtered = {mid: m for mid, m in active_matches.items() if _passes(m)}
+
+    # -----------------------------------------------------
     # Registrar Palpite
     # -----------------------------------------------------
     st.subheader("📝 Registrar Palpite")
-    if not active_matches:
-        st.info("Não há partidas abertas para receber palpites no momento.")
+    if not active_filtered:
+        st.info("Não há partidas abertas para receber palpites (verifique o filtro de campeonato/rodada).")
     else:
         with st.form("prediction_form"):
             st.write("Insira seus dados para participar do bolão:")
@@ -786,14 +1026,20 @@ def render_dashboard():
             user_phone = fc2.text_input("Seu WhatsApp (com DDD, ex: 11999999999)")
 
             selected_match_id = st.selectbox(
-                "Selecione a Partida", options=list(active_matches.keys()),
-                format_func=lambda mid: f"{active_matches[mid]['team_a']} x {active_matches[mid]['team_b']}")
+                "Selecione a Partida", options=list(active_filtered.keys()),
+                format_func=lambda mid: _match_label(active_filtered[mid]))
 
-            team_a_pred = active_matches[selected_match_id]['team_a'] if selected_match_id else ""
-            team_b_pred = active_matches[selected_match_id]['team_b'] if selected_match_id else ""
-            bet_amount = active_matches[selected_match_id]['bet_amount'] if selected_match_id else 0.0
+            sel = active_filtered[selected_match_id] if selected_match_id else {}
+            team_a_pred = sel.get("team_a", "")
+            team_b_pred = sel.get("team_b", "")
+            bet_amount = sel.get("bet_amount") or 0.0
+            info_bits = []
+            if sel.get("match_time"):
+                info_bits.append(f"🕒 {format_brt(sel['match_time'])}")
             if bet_amount:
-                st.caption(f"💰 Valor da aposta desta partida: **R$ {bet_amount:.2f}**")
+                info_bits.append(f"💰 Aposta: R$ {bet_amount:.2f}")
+            if info_bits:
+                st.caption(" · ".join(info_bits))
 
             col1, col2 = st.columns(2)
             with col1:
@@ -815,13 +1061,13 @@ def render_dashboard():
                 elif not selected_match_id:
                     st.error("Nenhuma partida selecionada!")
                 else:
-                    fake_msg = f"{user_name}: {team_a_pred} {score_a_pred} x {score_b_pred} {team_b_pred}"
-                    success, msg = parse_prediction(fake_msg, phone=user_phone, paid=paid_checkbox)
-                    if success:
+                    ok, msg = register_prediction(selected_match_id, user_name, user_phone,
+                                                  score_a_pred, score_b_pred, paid_checkbox)
+                    if ok:
                         registrado = format_brt(datetime.now(timezone.utc))
                         pgto = "✅ pagamento confirmado" if paid_checkbox else "⏳ pagamento pendente"
-                        st.success(f"{msg}\n\n🕒 Registrado em {registrado} · {pgto}. "
-                                   f"Entraremos em contato via {user_phone} se você ganhar!")
+                        st.success(f"Palpite de {user_name} para {team_a_pred} x {team_b_pred} registrado!\n\n"
+                                   f"🕒 {registrado} · {pgto}. Entraremos em contato via {user_phone} se você ganhar!")
                         st.rerun()
                     else:
                         st.error(msg)
@@ -832,21 +1078,26 @@ def render_dashboard():
     # Palpites (logo abaixo da entrada de dados)
     # -----------------------------------------------------
     st.subheader("📊 Palpites Registrados")
-    if detailed:
+    detailed_f = [d for d in detailed if _passes(d)]
+    has_rounds = any(d.get("round") for d in detailed_f)
+    if detailed_f:
         filtro = st.radio("Filtrar por pagamento", ["Todos", "✅ Pagos", "⏳ Pendentes"], horizontal=True)
         rows = []
-        for d in detailed:
+        for d in detailed_f:
             if filtro == "✅ Pagos" and not d["paid"]:
                 continue
             if filtro == "⏳ Pendentes" and d["paid"]:
                 continue
-            rows.append({
+            row = {
                 "Registrado em": format_brt(d["created_at"]),
                 "Nome": d["name"],
                 "Partida": f"{d['team_a']} x {d['team_b']}",
                 "Palpite": f"{d['score_a']} x {d['score_b']}",
                 "Pagamento": "✅ Pago" if d["paid"] else "⏳ Pendente",
-            })
+            }
+            if has_rounds:
+                row = {"Rodada": d.get("round") or "—", **row}
+            rows.append(row)
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
@@ -877,10 +1128,11 @@ def render_dashboard():
     # -----------------------------------------------------
     st.subheader("💰 Status dos Prêmios (Pix)")
     names_by_id = {d["user_id"]: d["name"] for d in detailed}
-    matches_with_preds = [mid for mid in matches_dict if any(d["match_id"] == mid for d in detailed)]
+    matches_with_preds = [mid for mid, m in matches_dict.items()
+                          if _passes(m) and any(d["match_id"] == mid for d in detailed)]
 
     if not matches_with_preds:
-        st.info("Nenhuma partida com palpites ainda.")
+        st.info("Nenhuma partida com palpites (para o filtro selecionado).")
     for mid in matches_with_preds:
         match = matches_dict[mid]
         preds = [d for d in detailed if d["match_id"] == mid]
