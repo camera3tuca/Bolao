@@ -7,32 +7,41 @@ Os dados ficam em um banco PostgreSQL ([Neon](https://neon.tech) ou
 
 ## Funcionalidades
 
-- **Importação de campeonatos (API-Football)**: puxa **todas as rodadas** de
-  Brasileirão A/B, Copa do Brasil ou Libertadores (jogos, datas e resultados) e
-  **atualiza os placares automaticamente** (ao abrir + botão manual).
+- **Importação de campeonatos (APIs gratuitas)**: puxa **todas as rodadas** da
+  temporada atual (jogos, datas e resultados) e **atualiza os placares
+  automaticamente** (ao abrir + botão manual).
+- **Ranking separado por campeonato** e **filtro por campeonato/rodada**.
 - **Layout de coluna única** (sem barra lateral), otimizado para tablet, com
-  indicadores (KPIs) e filtro por campeonato/rodada.
+  indicadores (KPIs).
 - **Registro de palpites** com data/hora (horário de Brasília) e confirmação
   de pagamento (Pix).
 - **Ranking automático**: 3 pontos por placar exato, 1 por acertar o vencedor.
 - **Controle de pagamento**: status Pago/Pendente, filtro na lista de palpites,
   confirmação pelo admin e **resumo de arrecadação** por partida (o prêmio é
   calculado sobre os **pagamentos confirmados**).
-- **Administração** por checkbox + senha: importar campeonato, criar/encerrar/
-  deletar partidas, confirmar pagamentos e deletar palpites.
+- **Administração** por checkbox + senha: importar/deletar campeonato,
+  criar/encerrar/deletar partidas, confirmar pagamentos e deletar palpites.
 
-## Importar um campeonato (API-Football)
+## Importar um campeonato (APIs gratuitas)
 
-1. Crie uma conta grátis em <https://dashboard.api-football.com/> e copie sua
-   **API key** (plano free: 100 requisições/dia).
-2. Adicione nos **Secrets** do Streamlit: `APIFOOTBALL_KEY = "sua-chave"`.
-3. No app: marque **Sou administrador** → **Importar campeonato** → escolha o
-   campeonato e a temporada → **Importar / Atualizar rodadas**.
+O app usa **duas fontes gratuitas**, escolhidas automaticamente por campeonato:
+
+| Campeonato | Fonte | Chave necessária |
+| --- | --- | --- |
+| Brasileirão Série A · Libertadores | [football-data.org](https://www.football-data.org/) | `FOOTBALLDATA_KEY` (conta grátis) |
+| Brasileirão Série B · Copa do Brasil | [TheSportsDB](https://www.thesportsdb.com/) | nenhuma (chave pública `3`) |
+
+1. Para Série A/Libertadores: crie a conta grátis na football-data.org, copie o
+   token e adicione nos **Secrets**: `FOOTBALLDATA_KEY = "seu-token"`.
+   (Série B/Copa do Brasil já funcionam sem chave.)
+2. No app: **Sou administrador** → **Importar campeonato** → escolha o
+   campeonato e a **temporada (ano atual)** → **Importar / Atualizar rodadas**.
 
 Os resultados são atualizados sozinhos ao abrir o app (no máximo 1x a cada 30
-min por instância, para respeitar o limite da API) e pelo botão **Atualizar
-resultados agora**. Ligas suportadas: Brasileirão Série A (71), Série B (72),
-Copa do Brasil (73) e Libertadores (13).
+min por instância) e pelo botão **Atualizar resultados agora**.
+
+> Observação: a TheSportsDB é comunitária, então os placares de Série B/Copa do
+> Brasil podem demorar um pouco mais para atualizar do que os da football-data.org.
 
 ## Como rodar localmente
 

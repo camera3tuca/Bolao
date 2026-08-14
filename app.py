@@ -645,65 +645,143 @@ def register_prediction(match_id, name, phone, score_a, score_b, paid):
 
 
 # ---------------------------------------------------------
-# Integração com API de campeonatos (API-Football / api-sports.io)
+# Integração com APIs GRATUITAS de campeonatos (multi-provedor)
 #
-# Importa todas as rodadas de um campeonato (jogos, datas e resultados) e
-# mantém os placares atualizados. Requer a chave APIFOOTBALL_KEY (conta
-# gratuita em https://dashboard.api-football.com/).
+# - football-data.org (grátis, temporada atual, confiável): Série A e
+#   Libertadores. Requer FOOTBALLDATA_KEY (conta grátis em
+#   https://www.football-data.org/).
+# - TheSportsDB (grátis, dados comunitários): Série B e Copa do Brasil.
+#   Usa a chave pública "3" por padrão (THESPORTSDB_KEY para trocar).
+#
+# Cada provedor devolve jogos num formato normalizado, então importar,
+# atualizar e mostrar funcionam igual para todos.
 # ---------------------------------------------------------
-APIFOOTBALL_BASE = "https://v3.football.api-sports.io"
+FOOTBALLDATA_BASE = "https://api.football-data.org/v4"
+THESPORTSDB_BASE = "https://www.thesportsdb.com/api/v1/json"
 
-# Ligas suportadas (ids da API-Football).
+# Campeonato -> provedor + configuração.
 COMPETITIONS = {
-    "Brasileirão Série A": 71,
-    "Brasileirão Série B": 72,
-    "Copa do Brasil": 73,
-    "Libertadores": 13,
+    "Brasileirão Série A": {"provider": "footballdata", "code": "BSA"},
+    "Libertadores":        {"provider": "footballdata", "code": "CLI"},
+    "Brasileirão Série B": {"provider": "thesportsdb", "league_id": "4352"},
+    "Copa do Brasil":      {"provider": "thesportsdb", "league_id": "4438"},
 }
 
-# Status da API-Football que indicam jogo encerrado.
-_FINISHED_STATUSES = ("FT", "AET", "PEN")
+# Rótulos amigáveis para as fases de mata-mata da football-data.org.
+_STAGE_PT = {
+    "PRELIMINARY_ROUND": "Preliminar", "FIRST_ROUND": "1ª fase",
+    "SECOND_ROUND": "2ª fase", "THIRD_ROUND": "3ª fase",
+    "GROUP_STAGE": "Fase de grupos", "PLAYOFFS": "Playoffs",
+    "LAST_16": "Oitavas", "ROUND_OF_16": "Oitavas",
+    "QUARTER_FINALS": "Quartas", "SEMI_FINALS": "Semifinal",
+    "FINAL": "Final", "REGULAR_SEASON": None,
+}
 
 
-def api_football_key():
-    return _secret("APIFOOTBALL_KEY") or _secret("API_FOOTBALL_KEY")
+def footballdata_key():
+    return _secret("FOOTBALLDATA_KEY") or _secret("FOOTBALL_DATA_KEY")
 
 
-def _round_label(raw):
-    """Converte o 'round' da API em rótulo curto. 'Regular Season - 12' ->
-    'Rodada 12'; fases de mata-mata são mantidas."""
-    if not raw:
-        return None
-    raw = str(raw).strip()
-    m = re.search(r'(\d+)\s*$', raw)
-    if "Regular Season" in raw and m:
-        return f"Rodada {int(m.group(1))}"
-    return raw
+def thesportsdb_key():
+    return _secret("THESPORTSDB_KEY", "3")
+
+
+def competition_provider_label(competition_name):
+    cfg = COMPETITIONS.get(competition_name, {})
+    return {"footballdata": "football-data.org",
+            "thesportsdb": "TheSportsDB"}.get(cfg.get("provider"), "—")
 
 
 def _round_sort_key(label):
-    """Ordena 'Rodada N' por N; outros rótulos vão para o fim, em ordem alfabética."""
+    """Ordena 'Rodada N' por N; outros rótulos vão para o fim."""
     m = re.search(r'(\d+)', label or "")
     return (0, int(m.group(1))) if (label and "Rodada" in label and m) else (1, label or "")
 
 
-def fetch_fixtures(league_id, season):
-    """Busca todos os jogos de uma liga/temporada na API-Football."""
-    key = api_football_key()
-    if not key:
-        raise RuntimeError("Chave APIFOOTBALL_KEY não configurada.")
+def _humanize_stage(stage):
+    if not stage:
+        return None
+    if stage in _STAGE_PT:
+        return _STAGE_PT[stage]
+    return str(stage).replace("_", " ").capitalize()
+
+
+def _http_get_json(url, headers=None, timeout=30):
     import urllib.request
     import json as _json
-    url = f"{APIFOOTBALL_BASE}/fixtures?league={int(league_id)}&season={int(season)}"
-    req = urllib.request.Request(url, headers={"x-apisports-key": key})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return _json.load(resp)
 
 
-def import_fixtures_payload(payload, competition_name, season):
-    """Insere/atualiza no banco os jogos vindos da API. Preserva o valor da
-    aposta (bet_amount) de partidas já existentes. Retorna quantos gravou."""
-    fixtures = payload.get("response", []) if isinstance(payload, dict) else []
+def _fetch_footballdata(cfg, season):
+    """Retorna jogos normalizados da football-data.org."""
+    key = footballdata_key()
+    if not key:
+        raise RuntimeError("Configure a chave FOOTBALLDATA_KEY nos Secrets.")
+    url = f"{FOOTBALLDATA_BASE}/competitions/{cfg['code']}/matches?season={int(season)}"
+    data = _http_get_json(url, headers={"X-Auth-Token": key})
+    if isinstance(data, dict) and data.get("errorCode"):
+        raise RuntimeError(data.get("message") or str(data))
+    out = []
+    for m in (data.get("matches") or []):
+        matchday = m.get("matchday")
+        rnd = f"Rodada {matchday}" if matchday else _humanize_stage(m.get("stage"))
+        completed = m.get("status") == "FINISHED"
+        ft = (m.get("score") or {}).get("fullTime") or {}
+        out.append({
+            "external_id": f"fd_{m.get('id')}",
+            "round": rnd,
+            "team_a": (m.get("homeTeam") or {}).get("name") or "?",
+            "team_b": (m.get("awayTeam") or {}).get("name") or "?",
+            "score_a": ft.get("home") if completed else None,
+            "score_b": ft.get("away") if completed else None,
+            "completed": completed,
+            "match_time": m.get("utcDate"),
+        })
+    return out
+
+
+def _fetch_thesportsdb(cfg, season):
+    """Retorna jogos normalizados da TheSportsDB."""
+    url = f"{THESPORTSDB_BASE}/{thesportsdb_key()}/eventsseason.php?id={cfg['league_id']}&s={int(season)}"
+    data = _http_get_json(url)
+    events = (data or {}).get("events") or []
+    out = []
+    for e in events:
+        rnum = str(e.get("intRound") or "").strip()
+        rnd = f"Rodada {int(rnum)}" if (rnum.isdigit() and int(rnum) > 0) else None
+        hs, aw = e.get("intHomeScore"), e.get("intAwayScore")
+        completed = (hs not in (None, "") and aw not in (None, ""))
+        ts = e.get("strTimestamp")
+        if not ts and e.get("dateEvent"):
+            ts = f"{e['dateEvent']}T{e.get('strTime') or '00:00:00'}"
+        out.append({
+            "external_id": f"tsdb_{e.get('idEvent')}",
+            "round": rnd,
+            "team_a": e.get("strHomeTeam") or "?",
+            "team_b": e.get("strAwayTeam") or "?",
+            "score_a": int(hs) if completed else None,
+            "score_b": int(aw) if completed else None,
+            "completed": completed,
+            "match_time": ts,
+        })
+    return out
+
+
+_PROVIDERS = {"footballdata": _fetch_footballdata, "thesportsdb": _fetch_thesportsdb}
+
+
+def fetch_competition_fixtures(competition_name, season):
+    cfg = COMPETITIONS.get(competition_name)
+    if not cfg:
+        raise RuntimeError("Campeonato não suportado.")
+    return _PROVIDERS[cfg["provider"]](cfg, season)
+
+
+def import_normalized(fixtures, competition_name, season):
+    """Insere/atualiza jogos já normalizados. Preserva o valor da aposta
+    (bet_amount) de partidas existentes. Retorna quantos gravou."""
     conn = get_db_connection()
     if not conn:
         return 0
@@ -711,20 +789,9 @@ def import_fixtures_payload(payload, competition_name, season):
     try:
         c = conn.cursor()
         for fx in fixtures:
-            try:
-                fid = fx["fixture"]["id"]
-                dt = fx["fixture"].get("date")
-                status = (fx["fixture"].get("status") or {}).get("short", "")
-                rnd = _round_label((fx.get("league") or {}).get("round"))
-                home = fx["teams"]["home"]["name"]
-                away = fx["teams"]["away"]["name"]
-                goals = fx.get("goals") or {}
-            except (KeyError, TypeError):
+            ext = fx.get("external_id")
+            if not ext:
                 continue
-            completed = status in _FINISHED_STATUSES
-            score_a = goals.get("home") if completed else None
-            score_b = goals.get("away") if completed else None
-            match_id = f"api_{fid}"
             c.execute('''
                 INSERT INTO matches (match_id, team_a, team_b, score_a, score_b,
                                      completed, bet_amount, external_id, round,
@@ -736,8 +803,10 @@ def import_fixtures_payload(payload, competition_name, season):
                     completed=excluded.completed, external_id=excluded.external_id,
                     round=excluded.round, match_time=excluded.match_time,
                     competition=excluded.competition, season=excluded.season
-            ''', (match_id, home, away, score_a, score_b, completed,
-                  str(fid), rnd, dt, competition_name, int(season)))
+            ''', (ext, fx.get("team_a"), fx.get("team_b"),
+                  fx.get("score_a"), fx.get("score_b"), bool(fx.get("completed")),
+                  ext, fx.get("round"), fx.get("match_time"),
+                  competition_name, int(season)))
             count += 1
         conn.commit()
     finally:
@@ -746,18 +815,16 @@ def import_fixtures_payload(payload, competition_name, season):
 
 
 def import_competition(competition_name, season):
-    """Importa/atualiza um campeonato. Retorna (qtd, erro)."""
-    league_id = COMPETITIONS.get(competition_name)
-    if not league_id:
+    """Importa/atualiza um campeonato pelo provedor certo. Retorna (qtd, erro)."""
+    if competition_name not in COMPETITIONS:
         return 0, "Campeonato não suportado."
     try:
-        payload = fetch_fixtures(league_id, season)
+        fixtures = fetch_competition_fixtures(competition_name, season)
     except Exception as e:  # noqa: BLE001
         return 0, str(e)
-    errs = payload.get("errors") if isinstance(payload, dict) else None
-    if errs:
-        return 0, f"API retornou erro: {errs}"
-    return import_fixtures_payload(payload, competition_name, season), None
+    if not fixtures:
+        return 0, "Nenhum jogo retornado (verifique o campeonato/temporada)."
+    return import_normalized(fixtures, competition_name, season), None
 
 
 def get_imported_competitions():
@@ -945,36 +1012,35 @@ def _render_admin_panel(matches_dict, detailed):
             st.rerun()
 
     st.divider()
-    st.markdown("**🌐 Importar campeonato (API-Football)**")
-    if not api_football_key():
-        st.info("Para importar campeonatos automaticamente, crie uma conta grátis em "
-                "https://dashboard.api-football.com/ e adicione a chave `APIFOOTBALL_KEY` "
-                "nos **Secrets** do Streamlit.")
-    else:
-        ic1, ic2 = st.columns([2, 1])
-        comp = ic1.selectbox("Campeonato", list(COMPETITIONS.keys()), key="imp_comp")
-        season = ic2.number_input("Temporada", min_value=2015, max_value=2100,
-                                  value=2024, step=1, key="imp_season")
-        st.caption("ℹ️ O plano **free** da API-Football libera temporadas de **2022 a 2024**. "
-                   "Para 2025/2026 é preciso um plano pago.")
-        ib1, ib2 = st.columns(2)
-        if ib1.button("⬇️ Importar / Atualizar rodadas", key="imp_btn"):
-            with st.spinner("Buscando rodadas na API..."):
-                n, err = import_competition(comp, int(season))
-            if err:
-                st.error(f"Falha ao importar: {err}")
-            else:
-                st.success(f"{n} jogos de {comp} {int(season)} importados/atualizados.")
-                st.rerun()
-        if ib2.button("🔄 Atualizar resultados agora", key="upd_btn"):
-            with st.spinner("Atualizando resultados..."):
-                res = update_all_imported()
-            if not res:
-                st.info("Nenhum campeonato importado ainda.")
-            else:
-                resumo = ", ".join(f"{c} {s}: {n}" + (" ⚠️" if e else "") for c, s, n, e in res)
-                st.success(f"Atualizado — {resumo}")
-                st.rerun()
+    st.markdown("**🌐 Importar campeonato (APIs gratuitas)**")
+    ic1, ic2 = st.columns([2, 1])
+    comp = ic1.selectbox("Campeonato", list(COMPETITIONS.keys()), key="imp_comp")
+    season = ic2.number_input("Temporada", min_value=2015, max_value=2100,
+                              value=datetime.now(BRT).year, step=1, key="imp_season")
+    provider = competition_provider_label(comp)
+    st.caption(f"Fonte: **{provider}** · use o **ano** da temporada (ex.: {datetime.now(BRT).year}).")
+    if COMPETITIONS[comp]["provider"] == "footballdata" and not footballdata_key():
+        st.warning("Este campeonato usa a **football-data.org**: crie uma conta grátis em "
+                   "https://www.football-data.org/ e adicione `FOOTBALLDATA_KEY` nos Secrets. "
+                   "(Série B e Copa do Brasil usam a TheSportsDB, que já funciona sem chave.)")
+    ib1, ib2 = st.columns(2)
+    if ib1.button("⬇️ Importar / Atualizar rodadas", key="imp_btn"):
+        with st.spinner("Buscando rodadas..."):
+            n, err = import_competition(comp, int(season))
+        if err:
+            st.error(f"Falha ao importar: {err}")
+        else:
+            st.success(f"{n} jogos de {comp} {int(season)} importados/atualizados.")
+            st.rerun()
+    if ib2.button("🔄 Atualizar resultados agora", key="upd_btn"):
+        with st.spinner("Atualizando resultados..."):
+            res = update_all_imported()
+        if not res:
+            st.info("Nenhum campeonato importado ainda.")
+        else:
+            resumo = ", ".join(f"{c} {s}: {n}" + (" ⚠️" if e else "") for c, s, n, e in res)
+            st.success(f"Atualizado — {resumo}")
+            st.rerun()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1006,7 +1072,7 @@ def render_dashboard():
 
     # Atualização automática dos resultados dos campeonatos importados
     # (throttled em 30 min; roda no máximo 1x por instância do servidor).
-    if api_football_key():
+    if get_imported_competitions():
         try:
             _auto_update_results()
         except Exception:
